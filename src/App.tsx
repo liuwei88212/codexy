@@ -258,6 +258,8 @@ export function App({
     draftModelSet,
     draftModelContexts,
     updateDraftModelContext,
+    draftModelDefaultReasoningEfforts,
+    updateDraftModelDefaultReasoningEffort,
     draftReasoningEfforts,
     reasoningEffortAutoByModel,
     modelPickerReasoningCapabilities,
@@ -858,6 +860,7 @@ export function App({
       baseUrl: string;
       maxConcurrency: number;
     },
+    modelDefaultReasoningEfforts?: Record<string, string>,
   ) {
     if (!config) return false;
     const profile = config.profiles.find((candidate) => candidate.id === routeId);
@@ -879,6 +882,7 @@ export function App({
         routeId,
         models,
         ...(modelContexts === undefined ? {} : { modelContexts }),
+        ...(modelDefaultReasoningEfforts === undefined ? {} : { modelDefaultReasoningEfforts }),
         enabled,
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
@@ -1747,6 +1751,8 @@ export function App({
         modelState={modelEditorState}
         draftModelSet={draftModelSet}
         draftModelContexts={draftModelContexts}
+        draftModelDefaultReasoningEfforts={draftModelDefaultReasoningEfforts}
+        onUpdateDraftModelDefaultReasoningEffort={updateDraftModelDefaultReasoningEffort}
         draftReasoningEfforts={draftReasoningEfforts}
         reasoningEffortAutoByModel={reasoningEffortAutoByModel}
         onUpdateDraftModelContext={updateDraftModelContext}

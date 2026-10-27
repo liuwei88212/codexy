@@ -5939,6 +5939,30 @@ test("portable guard bypasses compaction when backend says no ticket and blocks 
   }
 });
 
+test("portable guard preserves preparation failure reasons without dispatching", async () => {
+  for (const message of ["压缩历史缺少明确的源线路模型，请恢复原线路后重试", "", "   ", null, 42]) {
+    const calls = [];
+    const storage = memoryStorage();
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], {
+      storage,
+      portableBridge: async (path) => {
+        calls.push(path.split("/").at(-1));
+        return { status: "failed", message };
+      },
+    });
+    const before = storage.getItem("codey.thread-route-bindings.v1");
+    await assert.rejects(runtime.patch.guardOutgoingRequest({ hostId: "local" }, "turn/start",
+      { threadId: "unknown-source", model: "remote/shared" },
+      () => assert.fail("must not send target"),
+      () => assert.fail("must not compact unknown source")), {
+      message: typeof message === "string" && message.trim() ? message : "无法确认任务的原线路，请稍后重试。",
+    });
+    assert.deepEqual(calls, ["prepare"]);
+    assert.equal(storage.getItem("codey.thread-route-bindings.v1"), before);
+    runtime.patch.dispose();
+  }
+});
+
 test("native selection without local router never requests portable preparation", async () => {
   const runtime = await loadPatch({ status: "ok", native_selection_only: true, native_model_provider: "openai", models: ["gpt-6-astra"], default_model: "gpt-6-astra" }, [statsigClient()], {
     nativeSelectionOnly: true,

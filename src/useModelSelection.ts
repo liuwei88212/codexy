@@ -90,6 +90,15 @@ export function useModelSelection({
     Record<string, ModelReasoningEffort[]>
   >({});
   const [draftModelContexts, setDraftModelContexts] = useState<Record<string, ModelContextConfig>>({});
+  const [draftModelDefaultReasoningEfforts, setDraftModelDefaultReasoningEfforts] = useState<Record<string, string>>({});
+  const updateDraftModelDefaultReasoningEffort = useCallback((model: string, value: string) => {
+    setDraftModelDefaultReasoningEfforts((current) => {
+      const next = { ...current };
+      if (value) next[modelKey(model)] = value;
+      else delete next[modelKey(model)];
+      return next;
+    });
+  }, []);
   const updateDraftModelContext = useCallback((model: string, policy: ModelContextConfig | undefined) => {
     setDraftModelContexts((current) => {
       const next = { ...current };
@@ -104,17 +113,23 @@ export function useModelSelection({
         ...current,
         [modelKey(model)]: efforts,
       }));
+      // 缩小支持范围时清除失效默认值，避免提交无法执行的档位。
+      setDraftModelDefaultReasoningEfforts((current) => {
+        const key = modelKey(model);
+        if (!current[key] || efforts.some((effort) => effort.level === current[key])) return current;
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
     },
     [],
   );
   const resetDraftReasoningEffort = useCallback((model: string) => {
-    setDraftReasoningEfforts((current) => ({
-      ...current,
-      [modelKey(model)]:
-        reasoningEffortAutoByModel[modelKey(model)] ??
-        autoReasoningEfforts(DEFAULT_THIRD_PARTY_REASONING_EFFORTS),
-    }));
-  }, [reasoningEffortAutoByModel]);
+    updateDraftReasoningEffort(model,
+      reasoningEffortAutoByModel[modelKey(model)] ??
+      autoReasoningEfforts(DEFAULT_THIRD_PARTY_REASONING_EFFORTS),
+    );
+  }, [reasoningEffortAutoByModel, updateDraftReasoningEffort]);
   const [draftManualThirdPartyModels, setDraftManualThirdPartyModels] = useState<string[]>([]);
   const [deletedThirdPartyModels, setDeletedThirdPartyModels] = useState<string[]>([]);
   const [customModelInput, setCustomModelInput] = useState("");
@@ -224,6 +239,9 @@ export function useModelSelection({
       config?.selectedModelsByProvider[providerId] || [],
     ));
     setDraftModelContexts(config?.modelContextByProvider?.[providerId] || {});
+    setDraftModelDefaultReasoningEfforts(Object.fromEntries(Object.entries(
+      config?.modelDefaultReasoningEffortsByProvider?.[providerId] ?? {},
+    ).map(([model, value]) => [modelKey(model), value])));
     const storedReasoningEfforts = config?.modelReasoningEffortsByProvider?.[providerId];
     const reasoningModels = uniqueModelIds([
       ...state.upstreamModels,
@@ -381,6 +399,19 @@ export function useModelSelection({
     const existingUpstreamModel = modelEditorState.upstreamModels.find(
       (upstream) => modelKey(upstream) === modelKey(model),
     );
+    const key = modelKey(model);
+    if (!reasoningEffortAutoByModel[key]) {
+      const declared = modelEditorState.thirdPartyModelMetadata?.find(
+        (entry) => modelKey(entry.slug) === key,
+      )?.autoSupportedReasoningEfforts;
+      const resolved = resolveModelReasoningEfforts(
+        declared?.length ? declared : DEFAULT_THIRD_PARTY_REASONING_EFFORTS,
+        undefined,
+        modelPickerReasoningCapabilities[key],
+      );
+      setReasoningEffortAutoByModel((current) => ({ ...current, [key]: resolved.autoEfforts }));
+      setDraftReasoningEfforts((current) => ({ ...current, [key]: current[key] ?? resolved.efforts }));
+    }
     setDraftModels((current) =>
       includesModelId(current, model) ? current : [...current, model],
     );
@@ -402,6 +433,9 @@ export function useModelSelection({
     manualThirdPartyModelKeys,
     modelEditorState.officialModelIds,
     modelEditorState.upstreamModels,
+    modelEditorState.thirdPartyModelMetadata,
+    modelPickerReasoningCapabilities,
+    reasoningEffortAutoByModel,
     modelPickerRouteId,
     officialOnly,
   ]);
@@ -464,7 +498,15 @@ export function useModelSelection({
         (!officialOnly && includesModelId(thirdPartyModelOptions, model)),
       ),
     );
-    const contextUpdate = config?.localRouterEnabled === true ? { modelContexts } : {};
+    // 仅提交仍选中的模型，避免删除模型后留下默认强度。
+    const modelDefaultReasoningEfforts = Object.fromEntries(
+      [...officialModels, ...thirdPartyModels].flatMap((model) => {
+        const value = draftModelDefaultReasoningEfforts[modelKey(model)];
+        return value ? [[model, value]] : [];
+      }),
+    );
+    const contextUpdate = config?.localRouterEnabled === true
+      ? { modelContexts, modelDefaultReasoningEfforts } : {};
     const result = officialRoutePicker
       ? await invoke<{
           config: Config;
@@ -505,6 +547,7 @@ export function useModelSelection({
     config,
     draftReasoningEfforts,
     draftModelContexts,
+    draftModelDefaultReasoningEfforts,
     reasoningEffortAutoByModel,
     modelEditorState.officialModelIds,
     thirdPartyModelOptions,
@@ -562,6 +605,8 @@ export function useModelSelection({
     draftModelSet,
     draftModelContexts,
     updateDraftModelContext,
+    draftModelDefaultReasoningEfforts,
+    updateDraftModelDefaultReasoningEffort,
     draftReasoningEfforts,
     reasoningEffortAutoByModel,
     modelPickerReasoningCapabilities,

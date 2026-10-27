@@ -101,6 +101,8 @@
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
+      /* 收窄图标栏两侧留白，保留原生 36px 按钮的点击区域。 */
+      ${navigationRailSelector} { box-sizing: border-box; width: 44px !important; padding-inline: 4px !important; }
       /* Codex 原生小按钮：28×28、圆角 12.5px、图标继承按钮前景色，
          Codey 入口按同一套数值对齐，保证与相邻原生按钮同色同尺寸。 */
       #${buttonId} { --codey-icon-size: 16px; --codey-icon-color: currentColor; -webkit-app-region: no-drag !important; pointer-events: auto !important; position: relative; z-index: 2147483641; display: inline-grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; border: 0; border-radius: 12.5px; padding: 0; margin-inline-start: 8px; margin-inline-end: 18px; background: transparent; color: inherit; cursor: pointer; opacity: .86; user-select: none; transition: background .15s ease, opacity .15s ease, transform .15s ease; }

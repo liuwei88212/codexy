@@ -205,6 +205,9 @@ pub(crate) fn config_after_route_deletion(
     config
         .model_reasoning_efforts_by_provider
         .remove(&removed_provider_id);
+    config
+        .model_default_reasoning_efforts_by_provider
+        .remove(&removed_provider_id);
     config.profiles.retain(|profile| profile.id != route_id);
     config
         .selected_models_by_provider

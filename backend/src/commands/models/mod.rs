@@ -164,6 +164,10 @@ pub(super) async fn invoke(
                     route_id,
                     model_reasoning_efforts,
                     model_contexts,
+                    optional_argument::<BTreeMap<String, String>>(
+                        args,
+                        "modelDefaultReasoningEfforts",
+                    )?,
                 )
                 .await
             }
@@ -227,6 +231,12 @@ pub(super) async fn invoke(
                                 route_id,
                                 models,
                                 model_contexts,
+                                model_default_reasoning_efforts: optional_argument::<
+                                    BTreeMap<String, String>,
+                                >(
+                                    args,
+                                    "modelDefaultReasoningEfforts",
+                                )?,
                                 enabled,
                                 show_account_usage: show_usage,
                                 upstream_proxy,

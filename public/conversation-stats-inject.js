@@ -2,7 +2,7 @@
 // /session/stats 返回统计范围；会话 id 取自可见 composer，隐藏会话不参与。
 (() => {
   const PROBE_KEY = "__codeyConversationStats";
-  const VERSION = 7;
+  const VERSION = 11;
   const previous = window[PROBE_KEY];
   if (previous?.installed && (previous.version === VERSION || !previous.dispose)) return;
   previous?.dispose?.();
@@ -127,13 +127,16 @@
     if (document.getElementById(styleId)) return;
     const style = document.createElement("style");
     style.id = styleId;
+    // 底部留白来自原生定位容器，统计栏的直接父节点没有这段内边距。
     style.textContent = `
+      [class~="pb-(--thread-composer-bottom-inset)"]:has(#${barId}:not([hidden])) { padding-bottom: 2px !important; }
       ${styleScope} { --cs-text: var(--text-primary, CanvasText); --cs-muted: color-mix(in srgb, var(--cs-text) 60%, transparent); --cs-line: color-mix(in srgb, var(--cs-text) 11%, transparent); --cs-surface: color-mix(in srgb, var(--bg-primary, Canvas) 97%, var(--cs-text)); -webkit-app-region: no-drag !important; pointer-events: auto !important; position: relative; box-sizing: border-box; width: 100%; min-width: 0; padding: 5px 4px 0; color: var(--cs-text); font: 12px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; font-variant-numeric: tabular-nums; }
       ${styleScope} *, ${styleScope} *::before { box-sizing: border-box; }
       ${styleScope}[hidden], ${styleScope} [hidden] { display: none !important; }
-      ${styleScope} .codey-cs-groups { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 2px 10px; }
+      #${barId} { container: codey-stats / inline-size; }
+      ${styleScope} .codey-cs-groups { display: flex; flex-wrap: nowrap; justify-content: center; align-items: center; gap: 2px 10px; }
       ${styleScope} button { font: inherit; color: inherit; cursor: pointer; }
-      ${styleScope} .codey-cs-summary { display: inline-flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; min-width: 0; max-width: 100%; padding: 4px 9px; border: 0; border-radius: 999px; background: transparent; color: var(--cs-muted); text-align: center; }
+      ${styleScope} .codey-cs-summary { display: inline-flex; align-items: center; justify-content: center; flex-wrap: nowrap; gap: 6px; min-width: 0; max-width: 100%; padding: 2px 9px; border: 0; border-radius: 999px; background: transparent; color: var(--cs-muted); text-align: center; white-space: nowrap; }
       ${styleScope} .codey-cs-summary:hover, ${styleScope} .codey-cs-summary[aria-expanded="true"] { background: color-mix(in srgb, var(--cs-text) 5%, transparent); color: color-mix(in srgb, var(--cs-text) 72%, transparent); }
       ${styleScope} button:focus-visible { outline: 2px solid var(--cs-text); outline-offset: 2px; }
       ${styleScope} .codey-cs-icon { display: inline-block; width: 15px; height: 15px; flex: 0 0 15px; background: currentColor; mask: var(--cs-icon) center / contain no-repeat; }
@@ -147,7 +150,18 @@
       ${styleScope} dt { color: var(--cs-muted); }
       ${styleScope} dd { margin: 0; text-align: right; color: color-mix(in srgb, var(--cs-text) 72%, transparent); overflow-wrap: anywhere; }
       ${styleScope} .codey-cs-note { margin: 10px 0 0; color: var(--cs-muted); font-size: 10px; line-height: 1.6; }
-      @media (max-width: 480px) { ${styleScope} .codey-cs-groups { gap: 2px; } ${styleScope} .codey-cs-summary { padding-inline: 6px; font-size: 11px; } ${styleScope} .codey-cs-details { padding: 14px; } }
+      /* 分屏只缩窄聊天列，按统计栏宽度收紧间距，不能依赖整个窗口宽度。 */
+      @container codey-stats (max-width: 400px) {
+        #${barId} .codey-cs-groups { gap: 2px; }
+        #${barId} .codey-cs-summary { gap: 2px; padding-inline: 2px; font-size: 11px; }
+        #${barId} .codey-cs-icon { width: 12px; height: 12px; flex-basis: 12px; }
+      }
+      @container codey-stats (max-width: 320px) {
+        #${barId} .codey-cs-groups { gap: 1px; }
+        #${barId} .codey-cs-summary { gap: 1px; padding-inline: 0; }
+        #${barId} .codey-cs-icon { width: 11px; height: 11px; flex-basis: 11px; }
+      }
+      @media (max-width: 480px) { ${styleScope} .codey-cs-details { padding: 14px; } }
     `;
     document.documentElement.appendChild(style);
   };

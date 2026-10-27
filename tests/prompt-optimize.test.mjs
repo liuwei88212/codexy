@@ -679,14 +679,14 @@ test("mounts the optimize button for an enabled Codey route without a manual key
   assert.equal(env.snapshot().enabled, true);
 });
 
-test("keeps the original dark treatment at a 26px height", async () => {
+test("matches native icon buttons with a transparent 28px surface", async () => {
   const env = createEnvironment({ enabled: true, apiKeyConfigured: true });
   await flush();
 
   const button = env.getElementById("codey-prompt-optimize-button");
   const style = env.getElementById("codey-prompt-optimize-style");
-  assert.match(style.textContent, /height: 26px !important/);
-  assert.match(style.textContent, /background:\s*light-dark/);
+  assert.match(style.textContent, /height: 28px !important/);
+  assert.match(style.textContent, /background:\s*transparent/);
   assert.doesNotMatch(style.textContent, /--codey-ai-/);
   assert.doesNotMatch(button.innerHTML, /codey-prompt-optimize-ai-gradient/);
 });

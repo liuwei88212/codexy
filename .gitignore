@@ -49,3 +49,6 @@ Desktop.ini
 # Local plugin projects stay outside version control; SDK, templates and skills remain tracked.
 /plugins
 *.codey-plugin
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

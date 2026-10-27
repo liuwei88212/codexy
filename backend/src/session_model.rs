@@ -513,7 +513,7 @@ pub(crate) fn native_compaction_source(home: &Path, thread_id: &str) -> Result<O
     }
     identity.require_owner()?;
     if native_history && source.is_none() {
-        bail!("压缩历史缺少明确的源线路模型，请恢复原线路后重试");
+        bail!("此会话包含原生加密压缩历史，但旧记录未保存源账号线路，无法确认其能否跨账号使用；当前选择的账号不能作为历史来源。请在旧会话复制需要接续的可读消息，在新会话选择目标账号和模型后粘贴继续；若要保留完整压缩上下文，需恢复原账号并生成可移植摘要。重试或仅切换模型无法修复此历史。");
     }
     Ok(source)
 }
@@ -1186,7 +1186,11 @@ mod tests {
         unknown["payload"]["resume_metadata"]["previous_turn_settings"]["model"] =
             json!("raw-model");
         write(&[identity.clone(), unknown]);
-        assert!(native_compaction_source(home.path(), "saved").is_err());
+        let error = native_compaction_source(home.path(), "saved")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("原生加密压缩历史"));
+        assert!(error.contains("新会话选择目标账号和模型"));
         write(&[
             json!({"type":"session_meta","payload":{"id":"other","model_provider":"codey_router"}}),
             native,

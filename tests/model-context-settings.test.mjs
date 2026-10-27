@@ -55,7 +55,7 @@ test("官方模型选择器提交预算，并过滤不属于该线路的模型",
   await render().saveModelSelection();
   assert.deepEqual(calls, [{
     command: "save_official_route_models",
-    args: { routeId: "official", models: [model], modelContexts: { [model.toUpperCase()]: updated } },
+    args: { routeId: "official", models: [model], modelContexts: { [model.toUpperCase()]: updated }, modelDefaultReasoningEfforts: {} },
   }]);
   assert.deepEqual(config.modelContextByProvider["account-provider"], { [model]: policy });
 });

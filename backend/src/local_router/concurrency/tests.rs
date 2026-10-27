@@ -533,6 +533,28 @@ impl ResponsesDownstream for AdmissionDownstream {
 }
 
 #[tokio::test(start_paused = true)]
+async fn long_running_response_does_not_expire_queued_admission_after_one_minute() {
+    let (config, provider, _) = official_config("http://127.0.0.1:9/v1".into(), 1);
+    let server = super::super::lifecycle_tests::test_server(&config);
+    let route = Arc::clone(&server.snapshot.read().unwrap().routes[&provider]);
+    let mut first = AdmissionDownstream::default();
+    let permit = server.admit_official(&route, &mut first).await.unwrap();
+    let mut second = AdmissionDownstream::default();
+    let release = async {
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(server.official_concurrency.status()[0]["waiting"], 1);
+        drop(permit);
+    };
+    let (result, ()) = tokio::join!(server.admit_official(&route, &mut second), release);
+    let permit = result.unwrap();
+    assert!(second.error.is_none());
+    assert_eq!(server.official_concurrency.status()[0]["waiting"], 0);
+    assert_eq!(server.official_concurrency.status()[0]["running"], 1);
+    drop(permit);
+    assert_eq!(server.official_concurrency.status()[0]["running"], 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn queue_timeout_is_distinct_and_records_wait_without_upstream_send() {
     let (config, provider, _) = official_config("http://127.0.0.1:9/v1".into(), 1);
     let server = super::super::lifecycle_tests::test_server(&config);
@@ -544,12 +566,14 @@ async fn queue_timeout_is_distinct_and_records_wait_without_upstream_send() {
         probe: Some(probe.clone()),
         ..Default::default()
     };
+    let started = tokio::time::Instant::now();
     let error = server
         .admit_official(&route, &mut second)
         .await
         .err()
         .unwrap();
     assert!(error.is::<AdmissionEnded>());
+    assert_eq!(started.elapsed(), Duration::from_secs(10 * 60));
     assert_eq!(second.error, Some((504, "queue_wait_timeout".into())));
     // Tokio 虚拟时钟推进不推进 std::Instant，真实耗时字段仍然存在。
     assert!(probe.concurrency_wait_for_test().is_some());

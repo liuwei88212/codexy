@@ -320,6 +320,8 @@ impl CodeyConfig {
             self.model_context_by_provider.remove(&provider_id);
             self.model_reasoning_efforts_by_provider
                 .remove(&provider_id);
+            self.model_default_reasoning_efforts_by_provider
+                .remove(&provider_id);
             self.manual_third_party_models_by_provider
                 .remove(&provider_id);
             self.declared_official_models_by_provider
@@ -441,6 +443,18 @@ impl CodeyConfig {
                 .or_default();
             for (model, efforts) in models {
                 target.entry(model).or_insert(efforts);
+            }
+        }
+        if let Some(models) = self
+            .model_default_reasoning_efforts_by_provider
+            .remove(previous_provider_id)
+        {
+            let target = self
+                .model_default_reasoning_efforts_by_provider
+                .entry(official_provider_id.to_string())
+                .or_default();
+            for (model, effort) in models {
+                target.entry(model).or_insert(effort);
             }
         }
         migrate_provider_model_list(
@@ -703,6 +717,16 @@ impl CodeyConfig {
     }
 
     pub(crate) fn retain_model_contexts(&mut self, provider_id: &str, available: &[String]) {
+        if let Some(models) = self
+            .model_default_reasoning_efforts_by_provider
+            .get_mut(provider_id)
+        {
+            models.retain(|model, _| {
+                available
+                    .iter()
+                    .any(|candidate| model_id::equal(candidate, model))
+            });
+        }
         if let Some(models) = self.model_context_by_provider.get_mut(provider_id) {
             models.retain(|model, _| {
                 available
@@ -1140,6 +1164,16 @@ impl CodeyConfig {
                     .cloned()
             })
             .or_else(|| targets.into_iter().next())
+    }
+
+    pub(crate) fn default_model_reasoning_effort(&self) -> Option<&str> {
+        let target = self.effective_runtime_default_target()?;
+        self.model_default_reasoning_efforts_by_provider
+            .get(&target.provider_id)?
+            .iter()
+            .find(|(model, _)| model_id::equal(model, &target.upstream_model))
+            .map(|(_, effort)| effort.as_str())
+            .filter(|effort| MODEL_REASONING_EFFORT_LEVELS.contains(effort))
     }
 
     pub(crate) fn runtime_model_targets(&self) -> Vec<RuntimeModelTarget> {

@@ -14,7 +14,7 @@ import {
   reasoningEffortsEqual,
 } from "../modelReasoningEfforts";
 import { ModelContextWindowCombobox } from "./ModelContextWindowCombobox";
-import { Checkbox, Input } from "./ui";
+import { Checkbox, Input, Select } from "./ui";
 
 export type ModelSettingsReasoningProps = {
   autoEfforts: readonly ModelReasoningEffort[];
@@ -30,6 +30,11 @@ export type ModelSettingsFieldsProps = {
   onChange: (policy: ModelContextConfig | undefined) => void;
   policy?: ModelContextConfig;
   reasoning?: ModelSettingsReasoningProps;
+  defaultReasoning?: {
+    value: string;
+    supportedLevels: readonly string[];
+    onChange: (value: string) => void;
+  };
 };
 
 type TokenKInputProps = {
@@ -89,6 +94,7 @@ export function ModelSettingsFields({
   onChange,
   policy,
   reasoning,
+  defaultReasoning,
 }: ModelSettingsFieldsProps) {
   const selectedLevels = new Set(
     (reasoning?.efforts ?? []).map((effort) => effort.level),
@@ -108,6 +114,7 @@ export function ModelSettingsFields({
       )
     : MODEL_REASONING_EFFORT_LEVELS;
   const summaryBadges: string[] = [];
+  if (defaultReasoning?.value) summaryBadges.push(`推理 ${defaultReasoning.value}`);
   if (policy?.contextWindowTokens) {
     summaryBadges.push(`${formatTokenK(policy.contextWindowTokens)}K Token`);
   }
@@ -211,6 +218,22 @@ export function ModelSettingsFields({
         <p className="mt-2 text-[10px] leading-relaxed text-[var(--codey-subtle,#86868b)]">
           请先明确设置窗口，再调整压缩阈值和输出预留。阈值不能超过窗口的 90% 和预留后的有效空间；预留按整百分比向下取整，不是输出长度上限。
         </p>
+        {defaultReasoning && (
+          <label className="mt-3 flex flex-col gap-1 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 pt-2.5">
+            <span className="text-[11px] font-medium text-[var(--codey-text-soft,#4b5563)]">默认推理强度</span>
+            <Select
+              aria-label={`${model} 默认推理强度`}
+              disabled={disabled}
+              value={defaultReasoning.value || "auto"}
+              onChange={(value) => defaultReasoning.onChange(value === "auto" ? "" : String(value ?? ""))}
+              optionList={[
+                { value: "auto", label: "使用默认值" },
+                ...defaultReasoning.supportedLevels.map((level) => ({ value: level, label: level })),
+              ]}
+            />
+            <span className="text-[10px] text-[var(--codey-subtle,#86868b)]">设为默认模型时使用此强度。</span>
+          </label>
+        )}
         {reasoning && (
           <div className="mt-3 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 pt-2.5">
             <div className="mb-2 flex items-center justify-between gap-2">

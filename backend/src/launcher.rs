@@ -162,6 +162,8 @@ struct SessionMaintenanceSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeModelConfig {
+    model_default_reasoning_efforts_by_provider:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     routes: Vec<(String, String, bool, bool, bool)>,
     selected_models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
     model_reasoning_efforts_by_provider: std::collections::BTreeMap<
@@ -182,7 +184,9 @@ impl RuntimeModelConfig {
     /// Equivalent to `*self == Self::from_config(config)` without cloning the
     /// six model maps; the runtime-status poll calls this on every request.
     pub fn matches(&self, config: &CodeyConfig) -> bool {
-        self.routes.len() == config.profiles.len()
+        self.model_default_reasoning_efforts_by_provider
+            == config.model_default_reasoning_efforts_by_provider
+            && self.routes.len() == config.profiles.len()
             && self
                 .routes
                 .iter()
@@ -208,6 +212,9 @@ impl RuntimeModelConfig {
 
     pub fn from_config(config: &CodeyConfig) -> Self {
         Self {
+            model_default_reasoning_efforts_by_provider: config
+                .model_default_reasoning_efforts_by_provider
+                .clone(),
             routes: config
                 .profiles
                 .iter()
@@ -1046,8 +1053,45 @@ async fn prepare_codex_startup_state(
     runtime_subagent_config.fast_context_tools = applied.fast_context_tools_active;
     Ok(PreparedProviderState {
         runtime_config: runtime_subagent_config,
-        runtime_config_overrides: applied.runtime_config_overrides,
+        runtime_config_overrides: with_default_reasoning_effort(
+            applied.runtime_config_overrides,
+            config.default_model_reasoning_effort(),
+        ),
     })
+}
+
+fn with_default_reasoning_effort(mut overrides: Vec<String>, effort: Option<&str>) -> Vec<String> {
+    if let Some(effort) = effort {
+        // 只覆盖新会话启动参数，不修改用户 config.toml 或已保存会话。
+        overrides.retain(|entry| !entry.starts_with("model_reasoning_effort="));
+        overrides.push(format!("model_reasoning_effort=\"{effort}\""));
+    }
+    overrides
+}
+
+#[test]
+fn default_reasoning_overlay_replaces_selection_and_preserves_fallback() {
+    let original = vec![
+        "model_reasoning_effort=\"medium\"".into(),
+        "service_tier=\"default\"".into(),
+    ];
+    assert_eq!(
+        with_default_reasoning_effort(original.clone(), None),
+        original
+    );
+    let high = with_default_reasoning_effort(original, Some("high"));
+    assert_eq!(
+        high,
+        [
+            "service_tier=\"default\"",
+            "model_reasoning_effort=\"high\""
+        ]
+    );
+    let low = with_default_reasoning_effort(high, Some("low"));
+    assert_eq!(
+        low,
+        ["service_tier=\"default\"", "model_reasoning_effort=\"low\""]
+    );
 }
 
 fn startup_router_subagent_runtime_config(

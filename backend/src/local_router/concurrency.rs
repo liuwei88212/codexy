@@ -1,6 +1,7 @@
 use super::*;
 
-const OFFICIAL_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
+// 排队独立于上游响应计时；账号与全局额度等待共用这十分钟，避免逐段重置期限。
+const OFFICIAL_QUEUE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const WAITING: u8 = 0;
 const GRANTED: u8 = 1;
 const CLAIMED: u8 = 2;

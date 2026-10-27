@@ -3293,7 +3293,9 @@
         if ((aborted || disposed) && prepared?.token) void bridge("/session/portable-compaction/cancel", { threadId: target.threadId, token: prepared.token }).catch(() => {});
         return prepared;
       }));
-      if (ticket?.status !== "ok" || typeof ticket.required !== "boolean") throw new Error("无法确认任务的原线路，请稍后重试。");
+      // 保留后端的历史来源诊断，避免把不可重试的问题误报为临时故障。
+      if (ticket?.status !== "ok" || typeof ticket.required !== "boolean") throw new Error(
+        typeof ticket?.message === "string" && ticket.message.trim() ? ticket.message : "无法确认任务的原线路，请稍后重试。");
       if (!ticket.required) return;
       if (!ticket.token) throw new Error("交接摘要凭据无效，请稍后重试。");
       const thread = await checked(send("thread/read", { threadId: target.threadId, includeTurns: false }));

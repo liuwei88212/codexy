@@ -101,33 +101,29 @@
         display: none;
         flex: 0 0 auto;
         align-items: center;
-        gap: 5px;
+        justify-content: center;
         box-sizing: border-box;
-        min-height: 26px !important;
-        height: 26px !important;
+        min-height: 28px !important;
+        height: 28px !important;
         margin: 0 0 0 6px;
-        padding: 0 9px;
-        border: 1px solid light-dark(rgba(0,0,0,.12), rgba(255,255,255,.16));
+        width: 28px;
+        padding: 0;
+        border: 1px solid transparent;
         border-radius: 999px;
-        background: light-dark(#24292f, rgba(255, 255, 255, .12));
-        color: light-dark(#ffffff, #f0f6fc);
+        background: transparent;
+        color: var(--text-primary, light-dark(#1a1c1f, #f0f6fc));
         font: 500 12px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         cursor: pointer;
         user-select: none;
-        box-shadow: 0 1px 3px light-dark(rgba(0,0,0,.15), rgba(0,0,0,.4));
-        opacity: .92;
-        transition: opacity .15s ease, background-color .15s ease, transform .15s ease, box-shadow .15s ease;
+        box-shadow: none;
+        transition: opacity .15s ease, background-color .15s ease;
       }
       #${buttonId}:hover {
         opacity: 1;
-        background: light-dark(#32383f, rgba(255,255,255,.2));
-        border-color: light-dark(rgba(0,0,0,.2), rgba(255,255,255,.26));
-        transform: translateY(-0.5px);
-        box-shadow: 0 2px 6px light-dark(rgba(0,0,0,.2), rgba(0,0,0,.5));
+        background: light-dark(rgba(0,0,0,.06), rgba(255,255,255,.1));
       }
       #${buttonId}:active {
-        transform: translateY(0.5px);
-        box-shadow: 0 1px 2px light-dark(rgba(0,0,0,.1), rgba(0,0,0,.3));
+        background: light-dark(rgba(0,0,0,.1), rgba(255,255,255,.16));
       }
       #${buttonId}:disabled {
         cursor: not-allowed;
@@ -169,6 +165,7 @@
     element.dataset.codeyPromptOptimize = "true";
     element.setAttribute("contenteditable", "false");
     element.setAttribute("aria-label", "优化提示词");
+    element.title = "优化提示词";
     element.setAttribute("aria-disabled", "true");
     element.setAttribute("aria-busy", "false");
     element.disabled = true;
@@ -182,7 +179,6 @@
         stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
         <path d="M20 12a8 8 0 1 1-5.3-7.5"></path>
       </svg>
-      <span>优化</span>
     `;
     element.addEventListener("click", handleClick, true);
     return element;

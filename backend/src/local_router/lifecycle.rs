@@ -275,31 +275,68 @@ pub(super) async fn send_for_response_headers(
     tokio::time::error::Elapsed,
 > {
     let header_timeout = response_header_timeout(body.len(), header_timeout);
-    let (body, mut uploaded) = signaled_request_body(body);
-    let send = builder.body(body).send();
-    tokio::pin!(send);
-    let upload_limit = tokio::time::sleep(UPSTREAM_RESPONSE_TIMEOUT);
-    tokio::pin!(upload_limit);
-    let uploaded_first = tokio::select! {
-        biased;
-        result = &mut send => {
-            on_uploaded();
-            return Ok(result);
+    let deadline = tokio::time::Instant::now() + UPSTREAM_RESPONSE_TIMEOUT;
+    let mut retained_body = Some(body);
+    let mut released = false;
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut builder = builder;
+        for retry in 0..=3 {
+            let next_builder = builder.try_clone();
+            let (payload, mut uploaded) =
+                signaled_request_body(retained_body.as_ref().expect("not uploaded").clone());
+            let send = builder.body(payload).send();
+            tokio::pin!(send);
+            let result = tokio::select! {
+                biased;
+                result = &mut send => result,
+                uploaded = &mut uploaded => {
+                    if uploaded.is_ok() {
+                        // 上传后立即释放副本及内存名额；此后绝不透明重放。
+                        retained_body.take();
+                        released = true;
+                        on_uploaded();
+                        return tokio::time::timeout(header_timeout, send).await;
+                    }
+                    // 建连失败也会关闭上传信号，必须读取实际错误才能决定是否重连。
+                    send.await
+                }
+            };
+            let retryable = result.as_ref().err().is_some_and(transient_connect_error);
+            if retry == 3 || !retryable || next_builder.is_none() {
+                return Ok(result);
+            }
+            // 仅重连尚未发送 HTTP 请求的瞬时故障；1/2/4 秒退避共用同一期限。
+            tokio::time::sleep(Duration::from_secs(1 << retry)).await;
+            builder = next_builder.expect("retryable request builder");
         }
-        _ = &mut uploaded => true,
-        _ = &mut upload_limit => false,
-    };
-    // 正文已经交给连接，或这次发送不会再继续占用它。先交回准入名额，
-    // 再等待响应头，避免高思考的首字等待挡住后续请求。
-    on_uploaded();
-    if !uploaded_first {
-        return Err(
-            tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
-                .await
-                .expect_err("zero timeout"),
-        );
+        unreachable!("bounded connection attempts")
+    })
+    .await;
+    retained_body.take();
+    if !released {
+        on_uploaded();
     }
-    tokio::time::timeout(header_timeout, send).await
+    result.and_then(|result| result)
+}
+
+fn transient_connect_error(error: &reqwest::Error) -> bool {
+    if !error.is_connect() {
+        return false;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            return matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+            );
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// 生命周期只允许在尚未向下游写出响应时重发。与 reasoning 回退共享两次发送预算。
@@ -775,6 +812,88 @@ mod tests {
 
         let huge = response_header_timeout(usize::MAX, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
         assert_eq!(huge, UPSTREAM_RESPONSE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn connect_retry_preserves_body_until_upstream_recovers() {
+        let reserved = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let budget = Arc::new(Semaphore::new(1));
+        let server_budget = Arc::clone(&budget);
+        let mut permit = Some(budget.clone().try_acquire_owned().unwrap());
+        let server = tokio::spawn(async move {
+            // 首次连接必然失败，重连之前的等待仍持有请求内存名额。
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(server_budget.available_permits(), 0);
+            let listener = TcpListener::bind(address).await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await.unwrap();
+            assert_eq!(request.body, b"{\"input\":\"preserved\"}");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let response = send_for_response_headers(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(format!("http://{address}/")),
+            Bytes::from_static(b"{\"input\":\"preserved\"}"),
+            Duration::from_secs(5),
+            || {
+                permit.take();
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        assert_eq!(budget.available_permits(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_retry_never_replays_http_errors_or_partial_responses() {
+        for status in [401, 502, 200] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await.unwrap();
+                assert_eq!(request.body, b"hello");
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-length: 100\r\nconnection: close\r\n\r\npartial").as_bytes()).await.unwrap();
+                drop(socket);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let response = send_for_response_headers(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post(format!("http://{address}/")),
+                Bytes::from_static(b"hello"),
+                Duration::from_secs(5),
+                || {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert!(response.bytes().await.is_err());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

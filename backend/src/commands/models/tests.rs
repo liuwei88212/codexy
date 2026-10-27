@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn default_reasoning_selection_validates_and_clears_per_provider() {
+    let mut config = CodeyConfig::default();
+    let provider = config.profiles[0].provider_id().to_string();
+    let available = vec!["custom-model".into()];
+    let requested = BTreeMap::from([("CUSTOM-MODEL".into(), "high".into())]);
+    set_model_default_reasoning_efforts(&mut config, &provider, Some(&requested), &available)
+        .unwrap();
+    assert_eq!(
+        config.model_default_reasoning_efforts_by_provider[&provider]["custom-model"],
+        "high"
+    );
+    let invalid = BTreeMap::from([("custom-model".into(), "invalid".into())]);
+    assert!(
+        set_model_default_reasoning_efforts(&mut config, &provider, Some(&invalid), &available)
+            .is_err()
+    );
+    assert_eq!(
+        config.model_default_reasoning_efforts_by_provider[&provider]["custom-model"],
+        "high"
+    );
+    set_model_default_reasoning_efforts(&mut config, &provider, None, &available).unwrap();
+    assert!(!config.model_default_reasoning_efforts_by_provider[&provider].is_empty());
+    set_model_default_reasoning_efforts(&mut config, &provider, Some(&BTreeMap::new()), &available)
+        .unwrap();
+    assert!(config.model_default_reasoning_efforts_by_provider[&provider].is_empty());
+}
+
+#[test]
+fn omitted_default_reasoning_clears_only_selections_outside_updated_capabilities() {
+    let mut config = CodeyConfig::default();
+    let provider = config.profiles[0].provider_id().to_string();
+    let available = vec!["custom-model".into(), "other-model".into()];
+    let requested = BTreeMap::from([
+        ("custom-model".into(), "high".into()),
+        ("other-model".into(), "high".into()),
+    ]);
+    set_model_default_reasoning_efforts(&mut config, &provider, Some(&requested), &available)
+        .unwrap();
+    let capabilities = BTreeMap::from([(
+        "custom-model".into(),
+        vec![crate::config::ModelReasoningEffort {
+            level: "low".into(),
+            value: "low".into(),
+        }],
+    )]);
+    set_model_reasoning_efforts(&mut config, &provider, Some(&capabilities), &available).unwrap();
+    set_model_default_reasoning_efforts(&mut config, &provider, None, &available).unwrap();
+    assert_eq!(
+        config.model_default_reasoning_efforts_by_provider[&provider],
+        BTreeMap::from([("other-model".into(), "high".into())])
+    );
+    assert!(
+        set_model_default_reasoning_efforts(&mut config, &provider, Some(&requested), &available)
+            .is_err()
+    );
+}
+
+#[test]
 fn plugin_reasoning_limits_preserve_capabilities_and_reject_unsupported_settings() {
     use crate::config::ModelReasoningEffort;
     let mut config = CodeyConfig::default();
@@ -500,9 +558,16 @@ fn native_model_selection_updates_current_provider_models_without_route_edits() 
     }
     .normalize();
 
-    let mut selected =
-        config_with_native_selected_models(&config, &provider, &[], &["model-b".into()], &[], &[])
-            .unwrap();
+    let mut selected = config_with_native_selected_models(
+        &config,
+        &provider,
+        &[],
+        &["model-b".into()],
+        &[],
+        &[],
+        home.path(),
+    )
+    .unwrap();
     let state = native_model_state_for_provider(&selected, &provider, home.path()).unwrap();
     reconcile_subagent_models_for_mode(&mut selected, &state);
     selected = selected.normalize();
@@ -519,6 +584,7 @@ fn native_model_selection_updates_current_provider_models_without_route_edits() 
 
 #[test]
 fn native_official_model_selection_keeps_selection_official_only() {
+    let home = tempfile::tempdir().unwrap();
     let provider = codex_provider::CurrentProvider {
         id: "openai".into(),
         name: "OpenAI".into(),
@@ -539,6 +605,7 @@ fn native_official_model_selection_keeps_selection_official_only() {
         &[],
         &[],
         &[],
+        home.path(),
     )
     .unwrap();
 
@@ -546,7 +613,6 @@ fn native_official_model_selection_keeps_selection_official_only() {
         selected.selected_models_by_provider["openai"],
         ["gpt-5.6-sol"]
     );
-    let home = tempfile::tempdir().unwrap();
     let model_state = native_model_state_for_provider(&selected, &provider, home.path()).unwrap();
     let catalog = renderer_model_catalog_value(&selected, &model_state);
     assert_eq!(catalog["native_selection_only"], true);
@@ -565,6 +631,7 @@ fn native_official_model_selection_keeps_selection_official_only() {
             &["custom-model".into()],
             &[],
             &[],
+            home.path(),
         )
         .unwrap_err()
         .contains("官方线路不支持添加第三方模型")
@@ -625,9 +692,16 @@ fn native_third_party_gpt_selection_keeps_raw_ids_and_does_not_restore_unchecked
         provider.id.clone(),
         vec!["gpt-5.5".into(), "claude-sonnet-4-5".into()],
     );
-    let selected =
-        config_with_native_selected_models(&config, &provider, &[], &["gpt-5.5".into()], &[], &[])
-            .unwrap();
+    let selected = config_with_native_selected_models(
+        &config,
+        &provider,
+        &[],
+        &["gpt-5.5".into()],
+        &[],
+        &[],
+        home.path(),
+    )
+    .unwrap();
     let state = native_model_state_for_provider(&selected, &provider, home.path()).unwrap();
     assert_eq!(selected.profiles, config.profiles);
     assert_eq!(
@@ -875,6 +949,73 @@ fn reordering_official_route_models_follows_the_requested_order() {
     assert_eq!(
         reordered.runtime_catalog_models().1,
         ["gpt-5.6-luna", "gpt-5.6-sol"]
+    );
+}
+
+#[test]
+fn official_selection_uses_dynamic_snapshot_and_preserves_account_scope() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = CodeyConfig::default();
+    model_catalog::merge_account_runtime_models(
+        home.path(),
+        &[
+            json!({"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "base_instructions": "test instructions"}),
+            json!({"slug": "gpt-6-sol", "display_name": "GPT-6-Sol", "base_instructions": "test instructions"}),
+        ],
+        &config.codex_app_path,
+    )
+    .unwrap();
+    let provider = codex_provider::CurrentProvider {
+        id: "openai".into(),
+        name: "OpenAI".into(),
+        official: true,
+        supports_remote_compaction: true,
+        base_url: String::new(),
+    };
+    for upstream in [None, Some(Vec::new())] {
+        config.upstream_models_by_provider.clear();
+        if let Some(models) = upstream {
+            config
+                .upstream_models_by_provider
+                .insert(provider.id.clone(), models);
+        }
+        let catalog = official_model_ids_for_provider(&config, &provider.id, home.path()).unwrap();
+        let picker = native_model_state_for_provider(&config, &provider, home.path()).unwrap();
+        assert_eq!(catalog, picker.official_model_ids);
+        assert_eq!(
+            ordered_official_selection(&catalog, &["GPT-6.1-SOL".into()]).unwrap(),
+            ["gpt-6.1-sol"]
+        );
+        let saved = config_with_native_selected_models(
+            &config,
+            &provider,
+            &["gpt-6.1-sol".into()],
+            &[],
+            &[],
+            &[],
+            home.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.selected_models_by_provider["openai"], ["gpt-6.1-sol"]);
+        assert!(ordered_official_selection(&catalog, &["unknown-model".into()]).is_err());
+    }
+    config
+        .upstream_models_by_provider
+        .insert(provider.id.clone(), vec!["gpt-6-sol".into()]);
+    let catalog = official_model_ids_for_provider(&config, &provider.id, home.path()).unwrap();
+    assert_eq!(catalog, ["gpt-6-sol"]);
+    assert!(ordered_official_selection(&catalog, &["gpt-6.1-sol".into()]).is_err());
+    assert!(
+        config_with_native_selected_models(
+            &config,
+            &provider,
+            &["gpt-6.1-sol".into()],
+            &[],
+            &[],
+            &[],
+            home.path(),
+        )
+        .is_err()
     );
 }
 

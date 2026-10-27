@@ -16,6 +16,7 @@ pub async fn save_selected_models(
         BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
     >,
     requested_model_contexts: Option<BTreeMap<String, crate::config::ModelContextConfig>>,
+    model_default_reasoning_efforts: Option<BTreeMap<String, String>>,
 ) -> Result<Value, String> {
     let mut timings = ModelOperationTimings::new("save_selected_models");
     validate_requested_model_list_bounds("官方模型", &requested_official_models)?;
@@ -42,6 +43,7 @@ pub async fn save_selected_models(
             requested_route_id,
             requested_model_reasoning_efforts,
             requested_model_contexts,
+            model_default_reasoning_efforts,
         )
         .await;
     }
@@ -128,6 +130,13 @@ pub async fn save_selected_models(
     config
         .upstream_models_by_provider
         .insert(provider_id.clone(), supported_models);
+    let available = config.upstream_models_by_provider[&provider_id].clone();
+    set_model_default_reasoning_efforts(
+        &mut config,
+        &provider_id,
+        model_default_reasoning_efforts.as_ref(),
+        &available,
+    )?;
     if declared_official_models.is_empty() {
         config
             .declared_official_models_by_provider
@@ -217,6 +226,7 @@ pub(crate) async fn save_native_selected_models(
         BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
     >,
     requested_model_contexts: Option<BTreeMap<String, crate::config::ModelContextConfig>>,
+    model_default_reasoning_efforts: Option<BTreeMap<String, String>>,
 ) -> Result<Value, String> {
     let previous = state.config.read().await.clone();
     if previous.local_router_enabled {
@@ -262,13 +272,10 @@ pub(crate) async fn save_native_selected_models(
         &requested_third_party_models,
         &requested_manual_third_party_models,
         &requested_deleted_third_party_models,
+        codex_home(),
     )?;
     let available = if context.provider.official {
-        next.upstream_models_by_provider
-            .get(&context.provider.id)
-            .filter(|models| !models.is_empty())
-            .cloned()
-            .unwrap_or_else(model_catalog::default_official_model_slugs)
+        official_model_ids_for_provider(&next, &context.provider.id, codex_home())?
     } else {
         next.upstream_models_by_provider
             .get(&context.provider.id)
@@ -288,6 +295,12 @@ pub(crate) async fn save_native_selected_models(
         &available,
     )?;
     let model_state = native_model_state_for_provider(&next, &context.provider, codex_home())?;
+    set_model_default_reasoning_efforts(
+        &mut next,
+        &context.provider.id,
+        model_default_reasoning_efforts.as_ref(),
+        &available,
+    )?;
     reconcile_subagent_models_for_mode(&mut next, &model_state);
     next = next.normalize();
     if next != latest {
@@ -320,6 +333,7 @@ pub(crate) fn config_with_native_selected_models(
     requested_third_party_models: &[String],
     requested_manual_third_party_models: &[String],
     requested_deleted_third_party_models: &[String],
+    home: &std::path::Path,
 ) -> Result<CodeyConfig, String> {
     let provider_id = provider.id.clone();
     let mut next = config.clone();
@@ -330,12 +344,7 @@ pub(crate) fn config_with_native_selected_models(
         {
             return Err("官方线路不支持添加第三方模型".to_string());
         }
-        let official_models = next
-            .upstream_models_by_provider
-            .get(&provider_id)
-            .filter(|models| !models.is_empty())
-            .cloned()
-            .unwrap_or_else(model_catalog::default_official_model_slugs);
+        let official_models = official_model_ids_for_provider(&next, &provider_id, home)?;
         let (selected_models, third_party_models) =
             validate_manual_model_selection(&official_models, requested_official_models, &[])?;
         if selected_models.is_empty() {
@@ -547,6 +556,102 @@ pub(crate) fn set_model_reasoning_efforts(
         }
         config
             .model_reasoning_efforts_by_provider
+            .insert(provider_id.to_string(), canonical);
+    }
+    config.retain_model_contexts(provider_id, available);
+    Ok(())
+}
+
+pub(crate) fn set_model_default_reasoning_efforts(
+    config: &mut CodeyConfig,
+    provider_id: &str,
+    requested: Option<&BTreeMap<String, String>>,
+    available: &[String],
+) -> Result<(), String> {
+    let explicit = requested.is_some();
+    // 旧调用省略默认强度时，也按更新后的能力清理已失效选择。
+    let retained = if !explicit && config.local_router_enabled {
+        config
+            .model_default_reasoning_efforts_by_provider
+            .get(provider_id)
+            .cloned()
+    } else {
+        None
+    };
+    let requested = requested.or(retained.as_ref());
+    if let Some(requested) = requested {
+        validate_requested_model_list_bounds(
+            "默认推理强度模型",
+            &requested.keys().cloned().collect::<Vec<_>>(),
+        )?;
+        if !config.local_router_enabled {
+            let current = config
+                .model_default_reasoning_efforts_by_provider
+                .get(provider_id);
+            if current != Some(requested) && !(current.is_none() && requested.is_empty()) {
+                return Err("默认推理强度需要启用本地路由".into());
+            }
+            return Ok(());
+        }
+        let official = config
+            .profiles
+            .iter()
+            .any(|profile| profile.provider_id() == provider_id && profile.official_account);
+        let efforts = config.model_reasoning_efforts_for_provider(provider_id);
+        let state = model_catalog::selection_state_in_context(
+            codex_home(),
+            official,
+            Some(available),
+            available,
+            &[],
+            Some(&efforts),
+            None,
+            &model_catalog::CatalogContext::new(&config.codex_app_path),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut canonical = BTreeMap::new();
+        for (model, effort) in requested {
+            let Some(model) = available
+                .iter()
+                .find(|candidate| model_id::equal(candidate, model))
+            else {
+                if explicit {
+                    return Err(format!("模型 {model} 不在该线路的可用列表中"));
+                }
+                continue;
+            };
+            let effort = effort.trim();
+            let supported = if official {
+                state
+                    .official_models
+                    .iter()
+                    .find(|entry| model_id::equal(&entry.slug, model))
+                    .map(|entry| &entry.supported_reasoning_efforts)
+            } else {
+                state
+                    .third_party_model_metadata
+                    .iter()
+                    .find(|entry| model_id::equal(&entry.slug, model))
+                    .map(|entry| &entry.supported_reasoning_efforts)
+            };
+            if !crate::config::MODEL_REASONING_EFFORT_LEVELS.contains(&effort)
+                || !supported.is_some_and(|levels| levels.iter().any(|level| level == effort))
+            {
+                if explicit {
+                    return Err(format!("模型 {model} 不支持默认推理强度 {effort}"));
+                }
+                continue;
+            }
+            if canonical
+                .insert(model.clone(), effort.to_string())
+                .is_some()
+            {
+                return Err(format!("模型 {model} 的默认推理强度重复"));
+            }
+        }
+        // 全量替换该线路的选择，空对象恢复默认，其他线路保持独立。
+        config
+            .model_default_reasoning_efforts_by_provider
             .insert(provider_id.to_string(), canonical);
     }
     config.retain_model_contexts(provider_id, available);

@@ -340,6 +340,9 @@ fn forget_removed(config: &mut CodeyConfig, provider_ids: &[String]) {
             .model_reasoning_efforts_by_provider
             .remove(provider_id);
         config
+            .model_default_reasoning_efforts_by_provider
+            .remove(provider_id);
+        config
             .manual_third_party_models_by_provider
             .remove(provider_id);
         config

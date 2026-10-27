@@ -58,6 +58,18 @@
   const scanDebounceMs = 60;
   const maxScanLatencyMs = 250;
   const sidebarTitleCache = new Map();
+  const sessionTabs = new Map();
+  let sessionTabMenu = null;
+  let sessionTabsBar = null;
+  let sessionTabsPane = null;
+  let sessionTabsHeader = null;
+  const sessionTabsHeaderOffsets = new Map();
+  let sessionTabsResizeObserver = null;
+  let sessionTabsUnmountTimer = null;
+  let sessionTabsSignature = "";
+  let sessionTabsLastId = "";
+  let sessionTabsClosedId = "";
+  let sessionTabNavigationTimer = 0;
   let watcherWakeTimer = 0;
   let completionReconcileInFlight = false;
   let completionNextReconcileAt = 0;
@@ -675,6 +687,36 @@
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
+      #codey-session-tabs { display: flex; align-items: center; flex: 0 0 44px; height: 44px; box-sizing: border-box; gap: 4px; padding: 5px 8px; min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; border-bottom: 1px solid var(--color-token-border-default, #e8e8e8); background: var(--color-token-main-surface-primary, #fff); color: var(--color-text-primary, #1a1c1f); font: 13px/1.4 system-ui, sans-serif; -webkit-app-region: no-drag; }
+      #codey-session-tabs::-webkit-scrollbar { display: none; }
+      #codey-session-tabs[hidden] { display: none !important; }
+      #codey-session-tabs [data-codey-tab-list] { display: flex; align-items: center; gap: 4px; flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+      #codey-session-tabs [data-codey-tab-list]::-webkit-scrollbar { display: none; }
+      #codey-session-tabs [data-codey-tab-actions] { display: flex; align-items: center; flex: 0 0 auto; gap: 4px; padding-left: 6px; border-left: 1px solid var(--color-token-border-default, #e8e8e8); }
+      #codey-session-tabs [data-codey-tab-actions] button { justify-content: center; width: 28px; padding: 0; color: var(--color-text-secondary, #858585); }
+      [data-codey-chat-maximize] { display: inline-flex; align-items: center; justify-content: center; align-self: center; flex: 0 0 28px; width: 28px; height: 28px; margin-right: 6px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--color-text-secondary, #858585); cursor: pointer; -webkit-app-region: no-drag; }
+      [data-codey-chat-maximize]:hover { background: var(--color-background-primary-soft-hover, #f3f3f3); }
+      [data-codey-chat-maximize]:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+      #codey-session-tabs [data-codey-tab] { position: relative; display: flex; flex: 0 1 240px; min-width: 100px; align-items: center; max-width: 260px; height: 32px; padding-right: 4px; box-sizing: border-box; border: 1px solid transparent; border-radius: 8px; }
+      #codey-session-tabs [data-codey-tab]:hover { background: var(--color-background-primary-soft-hover, #f3f3f3); }
+      #codey-session-tabs [data-active=false]::after { content: ""; position: absolute; right: -3px; top: 9px; height: 12px; border-right: 1px solid var(--border-default, #8883); }
+      #codey-session-tabs [data-active=true] { border-color: var(--color-border-primary-outline, #dedede); background: var(--color-token-main-surface-primary, #fff); box-shadow: 0 1px 2px #00000008; }
+      #codey-session-tabs button { display: inline-flex; align-items: center; gap: 7px; color: inherit; background: transparent; border: 0; border-radius: 6px; cursor: pointer; font: inherit; height: 28px; padding: 4px 6px; flex-shrink: 0; }
+      #codey-session-tabs button:hover { background: var(--color-background-primary-soft-hover, #f3f3f3); }
+      #codey-session-tabs button:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+      #codey-session-tabs [data-codey-tab-title] { display: block; flex: 1 1 auto; min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-inline-start: 28px; position: relative; }
+      #codey-session-tabs [data-codey-tab-title]:hover { background: transparent; }
+      #codey-session-tabs [data-codey-tab-title]::before { content: ""; position: absolute; left: 8px; top: 8px; width: 13px; height: 11px; background: currentColor; mask: url('data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 14"%3E%3Cpath d="M1.5 4V2.5h5l2 2h6v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4Zm0 1h13" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/%3E%3C/svg%3E') center / contain no-repeat; }
+      #codey-session-tabs [data-codey-tab-status=running] [data-codey-tab-title]::before { width: 12px; height: 12px; box-sizing: border-box; border: 2px solid #8885; border-top-color: currentColor; border-radius: 50%; background: transparent; mask: none; animation: codey-tab-spin 1s linear infinite; }
+      #codey-session-tabs [data-codey-tab-status=unread] [data-codey-tab-title]::before { width: 8px; height: 8px; left: 10px; top: 10px; border-radius: 50%; background: #3984ff; mask: none; }
+      @keyframes codey-tab-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { #codey-session-tabs [data-codey-tab-status=running] [data-codey-tab-title]::before { animation: none; } }
+      #codey-session-tabs [data-codey-tab] > button:not([data-codey-tab-title]) { justify-content: center; margin-left: auto; width: 20px; height: 20px; border-radius: 50%; padding: 0; font-size: 16px; color: var(--color-text-secondary, #858585); }
+      #codey-session-tabs [data-codey-tab] > button:not([data-codey-tab-title]):hover { background: var(--color-background-primary-soft-hover, #0000000d); }
+      #codey-session-tabs [data-codey-tab-new] { flex: 0 0 28px; font-size: 20px; font-weight: 300; }
+      [data-codey-session-tabs-pane] { padding-top: var(--codey-session-tabs-height, 44px) !important; box-sizing: border-box !important; }
+      [data-codey-session-tabs-header] { translate: 0 var(--codey-session-tabs-height, 44px); }
+      #codey-session-tabs[data-floating=true] { position: fixed; z-index: 31; pointer-events: auto; }
       #${toolbarId} { -webkit-app-region: no-drag !important; position: fixed; right: 18px; top: 60px; z-index: 2147483644; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid rgba(124, 140, 255, .44); border-radius: 999px; background: rgba(20, 24, 36, .68); color: rgba(238, 242, 255, .94); box-shadow: 0 8px 24px rgba(0,0,0,.18); backdrop-filter: blur(10px); font: 12px/1 system-ui, sans-serif; }
       #${toolbarId}[hidden] { display: none; }
       #${toolbarId} button { border: 1px solid rgba(120, 140, 180, .34); border-radius: 999px; padding: 4px 8px; background: rgba(40, 50, 70, .48); color: inherit; cursor: pointer; font: 12px/1 system-ui, sans-serif; }
@@ -705,7 +747,15 @@
       [${projectImportAttribute}]:focus-visible,
       [${projectImportAttribute}][data-busy="true"] { opacity: .9; }
       [${projectImportAttribute}]:hover { opacity: 1 !important; }
-      [data-codey-session-action-row] { display: inline-flex !important; align-items: center !important; flex: 0 0 auto !important; flex-flow: row nowrap !important; gap: 1px !important; width: auto !important; min-width: max-content !important; white-space: nowrap !important; }
+      [data-codey-session-actions] { display: flex !important; align-items: center; flex-wrap: nowrap; }
+      [data-codey-session-title-row] { flex: 1 1 0% !important; min-width: 0 !important; width: auto !important; overflow: hidden; }
+      [data-codey-session-title-row] [data-thread-title] { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      [data-codey-session-action-row] { display: none !important; position: static !important; transform: none !important; align-items: center !important; flex: 0 0 auto !important; flex-flow: row nowrap !important; gap: 1px !important; width: auto !important; min-width: max-content !important; height: auto !important; white-space: nowrap !important; visibility: hidden; pointer-events: none !important; }
+      [data-codey-session-action-row] button { pointer-events: none !important; }
+      [data-codey-session-actions]:hover [data-codey-session-action-row],
+      [data-codey-session-actions]:focus-within [data-codey-session-action-row] { display: inline-flex !important; opacity: 1 !important; visibility: visible; pointer-events: auto !important; }
+      [data-codey-session-actions]:hover [data-codey-session-action-row] button,
+      [data-codey-session-actions]:focus-within [data-codey-session-action-row] button { pointer-events: auto !important; }
       #${sidebarActionTooltipId} { position: fixed; z-index: 2147483647; max-width: min(20rem, calc(100vw - 16px)); pointer-events: none; }
       [data-codey-pet-control-blocked="true"] { display: none !important; pointer-events: none !important; }
     `;
@@ -1014,18 +1064,13 @@
     queryWithin(root,
       "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]",
     ).forEach((thread) => {
-      if (
-        !(thread instanceof HTMLElement)
-        || thread.querySelector(`[${sessionExportAttribute}]`)
-      ) return;
+      if (!(thread instanceof HTMLElement)) return;
       const sessionId = String(thread.getAttribute("data-app-action-sidebar-thread-id") || "").trim();
       if (!sessionId) return;
       const archiveControl = findArchiveControl(thread);
       if (!(archiveControl instanceof HTMLElement)) return;
       const placementTarget = archivePlacementTarget(thread, archiveControl);
-      if (placementTarget.parentElement instanceof HTMLElement && placementTarget.parentElement !== thread) {
-        placementTarget.parentElement.setAttribute("data-codey-session-action-row", "true");
-      }
+      if (thread.querySelector(`[${sessionExportAttribute}]`)) return;
       const button = document.createElement("button");
       button.type = "button";
       button.setAttribute(sessionExportAttribute, "true");
@@ -1480,7 +1525,11 @@
     }
     const cacheKey = threadTimestampCacheKey(hostId, sessionId);
     const previous = threadWorkStateByRow.get(row);
-    if (previous?.cacheKey && previous.cacheKey !== cacheKey) {
+    // 虚拟列表会复用行；只有同一主机的临时会话取得正式 ID 时才迁移运行状态。
+    const resolvesPlaceholder = previous?.hostId === hostId
+      && previous.sessionId?.startsWith("client-new-thread:")
+      && !sessionId.startsWith("client-new-thread:");
+    if (resolvesPlaceholder) {
       const previousRunningState = threadRunningStateByCacheKey.get(previous.cacheKey);
       if (previousRunningState && !threadRunningStateByCacheKey.has(cacheKey)) {
         rememberBoundedMapValue(
@@ -1495,7 +1544,8 @@
     const workInProgress = stableThreadWorkInProgress(
       cacheKey,
       detectedWorkInProgress,
-      previous?.workInProgress === true,
+      (previous?.cacheKey === cacheKey || resolvesPlaceholder)
+        && previous?.workInProgress === true,
       {
         hostId,
         projectListId: threadProjectListIdFromRow(row),
@@ -1509,7 +1559,7 @@
       && previous.workInProgress
       && !workInProgress
     );
-    threadWorkStateByRow.set(row, { cacheKey, workInProgress });
+    threadWorkStateByRow.set(row, { cacheKey, hostId, sessionId, workInProgress });
     return {
       cacheKey,
       completedWork,
@@ -2915,26 +2965,40 @@
   };
 
   const archivePlacementTarget = (thread, archiveControl) => {
-    const wrapper = archiveControl.parentElement;
-    return wrapper instanceof HTMLElement && wrapper !== thread
-      ? wrapper
-      : archiveControl;
+    let target = archiveControl;
+    // 只跨过单按钮的透明包装，不能把整条原生操作栏当成归档按钮包装。
+    while (target.parentElement && target.parentElement !== thread) {
+      const wrapper = target.parentElement;
+      if (!(wrapper.tagName === "SPAN" || String(wrapper.getAttribute("class") || "").split(/\s+/).includes("contents"))
+        || wrapper.querySelectorAll("button, [role=button]").length !== 1) break;
+      target = wrapper;
+    }
+    const rail = target.parentElement;
+    if (rail && rail !== thread) {
+      thread.setAttribute("data-codey-session-actions", "true");
+      thread.querySelectorAll("[data-codey-session-action-row]").forEach((node) => {
+        if (node !== rail) node.removeAttribute("data-codey-session-action-row");
+      });
+      rail.setAttribute("data-codey-session-action-row", "true");
+      const title = [...thread.children].find((node) => !node.contains(rail));
+      title?.setAttribute("data-codey-session-title-row", "true");
+      // 热更新时也把旧版插在操作栏外的按钮迁回，避免重复创建或遗留换行。
+      thread.querySelectorAll(`[${sessionExportAttribute}], [${sessionDeleteAttribute}]`).forEach((button) => {
+        if (button.parentElement !== rail) target.insertAdjacentElement("beforebegin", button);
+      });
+    }
+    return target;
   };
 
   const installSessionDeleteButtons = (root = document) => {
     queryWithin(root,
       "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]",
     ).forEach((thread) => {
-      if (
-        !(thread instanceof HTMLElement)
-        || thread.querySelector(`[${sessionDeleteAttribute}]`)
-      ) return;
+      if (!(thread instanceof HTMLElement)) return;
       const archiveControl = findArchiveControl(thread);
       if (!(archiveControl instanceof HTMLElement)) return;
       const placementTarget = archivePlacementTarget(thread, archiveControl);
-      if (placementTarget.parentElement instanceof HTMLElement && placementTarget.parentElement !== thread) {
-        placementTarget.parentElement.setAttribute("data-codey-session-action-row", "true");
-      }
+      if (thread.querySelector(`[${sessionDeleteAttribute}]`)) return;
       const button = document.createElement("button");
       button.type = "button";
       button.setAttribute(sessionDeleteAttribute, "true");
@@ -3499,7 +3563,376 @@
     }
   };
 
-  const scan = (root = document, syncTitles = true) => {
+  // 只缓存已打开会话的原生点击入口；虚拟列表卸载后仍可复用路由回调。
+  const sessionTabNativeAction = (node) => {
+    if (!node) return null;
+    const key = Object.keys(node).find((name) => name.startsWith("__reactProps$"));
+    const onClick = key && node[key]?.onClick;
+    return { node, onClick: typeof onClick === "function" ? onClick : null };
+  };
+
+  const activateSessionTab = (tab, event) => {
+    const fresh = [...document.querySelectorAll("[data-app-action-sidebar-thread-id]")].find((row) => (
+      threadSessionIdFromRow(row) === tab.id
+      && threadHostIdFromRow(row) === tab.hostId
+    ));
+    const action = fresh ? sessionTabNativeAction(fresh) : tab.action;
+    try {
+      if (action?.node?.isConnected) action.node.click();
+      else if (action?.onClick) action.onClick(event);
+      else throw new Error("missing native navigation");
+      window.clearTimeout(sessionTabNavigationTimer);
+      sessionTabNavigationTimer = window.setTimeout(() => {
+        if (!disposed && getSessionId() !== tab.id) {
+          showRuntimeToast("未能切换会话，请从侧栏重新打开该会话。", "error");
+        }
+      }, 3000);
+    } catch {
+      showRuntimeToast("会话入口已失效，请从侧栏重新打开该会话。", "error");
+    }
+  };
+
+  const sessionTabVisible = (node) => isRenderedSessionElement(node)
+    && !node.closest('[hidden], [aria-hidden="true"]')
+    && (!window.getComputedStyle || window.getComputedStyle(node).visibility === "visible");
+
+  const positionSessionTabs = () => {
+    if (!sessionTabsBar || !sessionTabsHeader) return;
+    if (!sessionTabsHeader.isConnected || !sessionTabVisible(sessionTabsHeader)) {
+      syncSessionTabs();
+      return;
+    }
+    const height = sessionTabsBar.getBoundingClientRect().height || 44;
+    const rect = sessionTabsHeader.getBoundingClientRect();
+    const previous = sessionTabsHeader.hasAttribute("data-codey-session-tabs-header")
+      ? (sessionTabsHeaderOffsets.get(sessionTabsHeader) || 0) : 0;
+    const top = rect.top - previous;
+    sessionTabsBar.style.left = `${rect.left}px`;
+    sessionTabsBar.style.top = `${top}px`;
+    sessionTabsBar.style.width = `${rect.width}px`;
+    sessionTabsPane?.style.setProperty("--codey-session-tabs-height", `${height}px`);
+    // 部分会话会并存不同标题容器，只补足与 TAB 重叠的部分，不重复叠加位移。
+    const headers = [...document.querySelectorAll('[data-app-shell-main-titlebar]')]
+      .filter((node) => sessionTabVisible(node) && node.getBoundingClientRect().width > 0);
+    for (const header of headers) {
+      const bounds = header.getBoundingClientRect();
+      if (Math.abs(bounds.left - rect.left) > 2 || Math.abs(bounds.width - rect.width) > 2) continue;
+      const old = header.hasAttribute("data-codey-session-tabs-header") ? (sessionTabsHeaderOffsets.get(header) || 0) : 0;
+      const baseTop = bounds.top - old;
+      if (header !== sessionTabsHeader && (baseTop >= top + height || baseTop + bounds.height <= top)) continue;
+      const offset = Math.max(0, top + height - baseTop);
+      sessionTabsHeaderOffsets.set(header, offset);
+      header.style.setProperty("--codey-session-tabs-height", `${offset}px`);
+      if (!header.hasAttribute("data-codey-session-tabs-header")) header.setAttribute("data-codey-session-tabs-header", "");
+    }
+  };
+
+  const clearSessionTabsMount = (preserveBar = false) => {
+    window.clearTimeout(sessionTabsUnmountTimer);
+    sessionTabsUnmountTimer = null;
+    sessionTabsResizeObserver?.disconnect();
+    sessionTabsResizeObserver = null;
+    window.removeEventListener("resize", positionSessionTabs);
+    sessionTabsPane?.removeAttribute("data-codey-session-tabs-pane");
+    sessionTabsPane?.style.removeProperty("--codey-session-tabs-height");
+    for (const header of sessionTabsHeaderOffsets.keys()) {
+      header.removeAttribute("data-codey-session-tabs-header");
+      header.style.removeProperty("--codey-session-tabs-height");
+    }
+    sessionTabsHeaderOffsets.clear();
+    sessionTabsPane = null;
+    sessionTabsHeader = null;
+    if (!preserveBar) {
+      document.querySelectorAll('[data-codey-chat-maximize]').forEach((button) => button.remove());
+      sessionTabsBar?.remove();
+      sessionTabsBar = null;
+      sessionTabsSignature = "";
+    }
+  };
+
+  const syncSessionMaximizeButton = (header) => {
+    const native = [...document.querySelectorAll('button[data-app-shell-workspace-layout-toggle="right-panel"]')]
+      .find(sessionTabVisible);
+    document.querySelectorAll('[data-codey-chat-maximize]').forEach((button) => {
+      if (!header?.contains(button) || !native) button.remove();
+    });
+    if (!header || !native || header.contains(native)) return;
+    let button = header.querySelector('[data-codey-chat-maximize]');
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("data-codey-chat-maximize", "");
+      button.setAttribute("data-codey-layout-toggle", "right-panel");
+      // 最大化属于当前会话；独立于 TAB 生命周期，完整视图中仍可还原。
+      button.addEventListener("click", () => {
+        [...document.querySelectorAll('button[data-app-shell-workspace-layout-toggle="right-panel"]')]
+          .find(sessionTabVisible)?.click();
+      });
+      header.appendChild(button);
+    }
+    if (button.innerHTML !== native.innerHTML) button.innerHTML = native.innerHTML;
+    const label = native.getAttribute("aria-label") || "切换完整视图";
+    if (button.getAttribute("aria-label") !== label) {
+      button.setAttribute("aria-label", label);
+      button.title = label;
+    }
+    const pressed = native.getAttribute("aria-pressed");
+    if (pressed === null) button.removeAttribute("aria-pressed");
+    else if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+  };
+
+  const closeSessionTabMenu = () => {
+    sessionTabMenu?.remove();
+    sessionTabMenu = null;
+    document.removeEventListener("pointerdown", dismissSessionTabMenu);
+    document.removeEventListener("keydown", dismissSessionTabMenu);
+  };
+  const dismissSessionTabMenu = (event) => {
+    if (event.type === "keydown" ? event.key === "Escape" : !sessionTabMenu?.contains(event.target)) closeSessionTabMenu();
+  };
+  const openSessionTabMenu = (event, key) => {
+    event.preventDefault();
+    closeSessionTabMenu();
+    const tab = sessionTabs.get(key);
+    if (!tab) return;
+    const menu = document.createElement("div");
+    sessionTabMenu = menu;
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "标签操作");
+    menu.style.cssText = "position:fixed;z-index:10000;padding:4px;border:1px solid #8883;border-radius:8px;background:var(--color-token-main-surface-primary,#fff);color:var(--color-text-primary,#1a1c1f);box-shadow:0 4px 16px #0002;min-width:140px";
+    const keys = [...sessionTabs.keys()];
+    const index = keys.indexOf(key);
+    const actions = [
+      [tab.locked ? "解除锁定" : "锁定", null],
+      ["关闭其他", keys.filter((item) => item !== key)],
+      ["关闭左侧", keys.slice(0, index)],
+      ["关闭右侧", keys.slice(index + 1)],
+    ];
+    for (const [label, targets] of actions) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
+      button.textContent = label;
+      button.style.cssText = "display:block;width:100%;padding:7px 12px;border:0;border-radius:4px;background:transparent;color:inherit;text-align:left;cursor:pointer";
+      button.disabled = targets !== null && !targets.some((item) => !sessionTabs.get(item)?.locked);
+      button.addEventListener("click", () => {
+        if (targets === null) {
+          tab.locked = !tab.locked;
+          // 锁定项稳定排在最前；关闭入口统一保护，只有解除锁定后才能移除。
+          const ordered = [...sessionTabs].sort((a, b) => Number(!!b[1].locked) - Number(!!a[1].locked));
+          sessionTabs.clear();
+          for (const [id, value] of ordered) sessionTabs.set(id, value);
+        } else {
+          for (const id of targets) {
+            const target = sessionTabs.get(id);
+            if (!target || target.locked) continue;
+            if (target.id === getSessionId()) sessionTabsClosedId = target.id;
+            sessionTabs.delete(id);
+          }
+        }
+        closeSessionTabMenu();
+        syncSessionTabs();
+      });
+      menu.appendChild(button);
+    }
+    document.body.appendChild(menu);
+    const bounds = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(0, Math.min(event.clientX, window.innerWidth - bounds.width))}px`;
+    menu.style.top = `${Math.max(0, Math.min(event.clientY, window.innerHeight - bounds.height))}px`;
+    document.addEventListener("pointerdown", dismissSessionTabMenu);
+    document.addEventListener("keydown", dismissSessionTabMenu);
+    menu.querySelector("button")?.focus();
+  };
+
+  const syncSessionTabs = () => {
+    if (disposed) return;
+    const id = getSessionId();
+    if (id && id !== sessionTabsLastId) sessionTabsClosedId = "";
+    if (id) sessionTabsLastId = id;
+    const rows = [...document.querySelectorAll("[data-app-action-sidebar-thread-id]")];
+    const activeRow = rows.find((row) => (
+      threadSessionIdFromRow(row) === id
+      && row.getAttribute("data-app-action-sidebar-thread-active") === "true"
+    )) || rows.find((row) => threadSessionIdFromRow(row) === id);
+    const hostId = activeRow ? threadHostIdFromRow(activeRow) : "local";
+    const activeKey = threadTimestampCacheKey(hostId, id);
+    if (id && id !== sessionTabsClosedId && !sessionTabs.has(activeKey)) {
+      sessionTabs.set(activeKey, { id, hostId, title: getSessionTitle(id) || "未命名会话", action: null });
+    }
+    for (const tab of sessionTabs.values()) {
+      const row = rows.find((item) => threadSessionIdFromRow(item) === tab.id
+        && threadHostIdFromRow(item) === tab.hostId);
+      if (!row) continue;
+      tab.title = row.getAttribute("data-app-action-sidebar-thread-title") || tab.title;
+      tab.action = sessionTabNativeAction(row);
+      // 与侧栏共用原生状态判定；虚拟列表卸载时保留最后一次确认的状态。
+      tab.status = nativeThreadWorkInProgress(row) ? "running"
+        : nativeReactThreadStatusState(row)?.unread === true ? "unread" : "idle";
+    }
+    // 新版桌面的 main 是隐藏浮层；实际聊天列以拖放容器标识，不能只看矩形大小。
+    const pane = [...document.querySelectorAll('[data-codex-thread-reference-drop-target]')]
+      .find((node) => node.getAttribute("contenteditable") !== "true" && sessionTabVisible(node));
+    const header = [...document.querySelectorAll('[data-app-shell-main-titlebar]')]
+      .find((node) => sessionTabVisible(node) && node.getBoundingClientRect().width > 0);
+    syncSessionMaximizeButton(header);
+    const layout = pane?.closest('[data-app-shell-workspace-layout]')
+      || [...document.querySelectorAll('[data-app-shell-workspace-layout="full"]')].find(sessionTabVisible);
+    const maximized = layout?.getAttribute("data-app-shell-workspace-layout") === "full"
+      || pane?.closest('[data-app-shell-right-panel-full-width="true"]')
+      || [...document.querySelectorAll('button[data-app-shell-workspace-layout-toggle="right-panel"][aria-pressed="true"]')].some(sessionTabVisible);
+    if (maximized) {
+      // 最大化只展示当前内容；保留标签集合，退出后复用，且释放原标题栏占位。
+      clearSessionTabsMount(true);
+      if (sessionTabsBar) sessionTabsBar.hidden = true;
+      return;
+    }
+    const main = pane || header?.parentElement || [...document.querySelectorAll('main, [role="main"]')].find(sessionTabVisible);
+    if (!main || (!id && !pane) || (sessionTabsHeader && !header)) {
+      // 原生路由会短暂卸载聊天容器；给它一次恢复窗口，离开聊天页后仍会清理。
+      if (sessionTabsBar && sessionTabsUnmountTimer === null) {
+        sessionTabsUnmountTimer = window.setTimeout(() => {
+          if (!disposed) clearSessionTabsMount();
+        }, 1000);
+      }
+      return;
+    }
+    window.clearTimeout(sessionTabsUnmountTimer);
+    sessionTabsUnmountTimer = null;
+    if (!id && !sessionTabsBar) return;
+    const mount = header ? document.body : main;
+    if (!sessionTabsBar?.isConnected || sessionTabsBar.parentElement !== mount
+      || sessionTabsPane !== pane || sessionTabsHeader !== header) {
+      // 只重绑布局锚点，保持同一导航节点，避免切换会话时消失再出现。
+      clearSessionTabsMount(true);
+      if (!sessionTabsBar) {
+        sessionTabsBar = document.createElement("nav");
+        sessionTabsBar.id = "codey-session-tabs";
+        sessionTabsBar.setAttribute("aria-label", "已打开的会话");
+      }
+      sessionTabsPane = pane;
+      sessionTabsHeader = header;
+      if (header) {
+        // 仅下移聊天标题栏并给正文留出同高空间，保留原生按钮及右侧工具栏。
+        pane?.setAttribute("data-codey-session-tabs-pane", "");
+        sessionTabsBar.setAttribute("data-floating", "true");
+        if (sessionTabsBar.parentElement !== mount) mount.appendChild(sessionTabsBar);
+        if (window.ResizeObserver) {
+          sessionTabsResizeObserver = new window.ResizeObserver(positionSessionTabs);
+          sessionTabsResizeObserver.observe(header);
+          if (pane) sessionTabsResizeObserver.observe(pane);
+        }
+        window.addEventListener("resize", positionSessionTabs);
+      } else {
+        sessionTabsBar.removeAttribute("data-floating");
+        main.insertBefore(sessionTabsBar, main.firstChild);
+      }
+    }
+    positionSessionTabs();
+    sessionTabsBar.hidden = false;
+    if (!id) return;
+    const nativeLayoutButtons = [...document.querySelectorAll('button[data-app-shell-workspace-layout-toggle]')]
+      .filter((node) => node.getAttribute("data-app-shell-workspace-layout-toggle") !== "right-panel"
+        && !sessionTabsBar.contains(node) && sessionTabVisible(node));
+    const signature = JSON.stringify([activeKey, [...sessionTabs].map(([key, tab]) => [key, tab.title, !!tab.locked, tab.status]),
+      nativeLayoutButtons.map((node) => [node.getAttribute("data-app-shell-workspace-layout-toggle"), node.getAttribute("aria-label"), node.innerHTML])]);
+    if (signature === sessionTabsSignature) return;
+    sessionTabsSignature = signature;
+    while (sessionTabsBar.firstChild) sessionTabsBar.removeChild(sessionTabsBar.firstChild);
+    const tabList = document.createElement("div");
+    tabList.setAttribute("data-codey-tab-list", "");
+    tabList.addEventListener("wheel", (event) => {
+      if (event.ctrlKey || tabList.scrollWidth <= tabList.clientWidth) return;
+      // 普通滚轮转为横向滚动；触控板保留主方向，缩放手势不拦截。
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? tabList.clientWidth : 1;
+      tabList.scrollLeft += delta * unit;
+      event.preventDefault();
+    }, { passive: false });
+    sessionTabsBar.appendChild(tabList);
+    for (const [key, tab] of sessionTabs) {
+      const item = document.createElement("div");
+      item.setAttribute("data-codey-tab", key);
+      item.setAttribute("data-active", String(key === activeKey));
+      item.setAttribute("data-codey-tab-status", tab.status || "idle");
+      item.addEventListener("contextmenu", (event) => openSessionTabMenu(event, key));
+      const title = document.createElement("button");
+      title.type = "button";
+      title.setAttribute("data-codey-tab-title", "");
+      title.setAttribute("aria-current", key === activeKey ? "page" : "false");
+      title.textContent = tab.title;
+      title.title = `${tab.title}${tab.status === "running" ? "（运行中）" : tab.status === "unread" ? "（未读）" : ""}`;
+      title.setAttribute("aria-label", title.title);
+      title.addEventListener("click", (event) => activateSessionTab(tab, event));
+      item.appendChild(title);
+      if (tab.locked) {
+        const lock = document.createElement("span");
+        lock.textContent = "🔒";
+        lock.setAttribute("aria-label", "已锁定");
+        lock.style.cssText = "position:absolute;left:14px;top:13px;font-size:9px;line-height:12px;pointer-events:none";
+        item.appendChild(lock);
+      }
+      const close = document.createElement("button");
+      close.type = "button";
+      close.textContent = "×";
+      close.title = "关闭标签（保留会话）";
+      close.setAttribute("aria-label", `关闭标签：${tab.title}`);
+      close.disabled = !!tab.locked;
+      if (tab.locked) close.style.visibility = "hidden";
+      close.addEventListener("click", () => {
+        if (tab.locked) return;
+        // 关闭只改变标签集合，当前会话继续显示，避免丢失输入或停止任务。
+        if (key === activeKey) sessionTabsClosedId = tab.id;
+        sessionTabs.delete(key);
+        syncSessionTabs();
+        sessionTabsBar?.querySelector("button")?.focus();
+      });
+      item.appendChild(close);
+      tabList.appendChild(item);
+    }
+    const newChat = document.createElement("button");
+    newChat.type = "button";
+    newChat.textContent = "+";
+    newChat.title = "新聊天";
+    newChat.setAttribute("aria-label", "新聊天");
+    newChat.setAttribute("data-codey-tab-new", "");
+    newChat.addEventListener("click", () => {
+      // 复用原生入口，保留 Codex 的草稿与项目选择流程。
+      const native = [...document.querySelectorAll('button, a[href], [role="button"]')].find((node) => (
+        !sessionTabsBar?.contains(node)
+        && sessionTabVisible(node)
+        && /^(新聊天|新建聊天|New chat|New thread)$/i.test(
+          (node.getAttribute("aria-label") || node.textContent || "").trim(),
+        )
+      ));
+      if (native) native.click();
+      else showRuntimeToast("未找到新聊天入口，请展开侧栏后重试。", "error");
+    });
+    tabList.appendChild(newChat);
+    if (nativeLayoutButtons.length) {
+      const actions = document.createElement("div");
+      actions.setAttribute("data-codey-tab-actions", "");
+      for (const native of nativeLayoutButtons) {
+        const button = document.createElement("button");
+        const toggle = native.getAttribute("data-app-shell-workspace-layout-toggle");
+        button.type = "button";
+        button.innerHTML = native.innerHTML;
+        button.title = native.getAttribute("aria-label") || "切换布局";
+        button.setAttribute("aria-label", button.title);
+        button.setAttribute("data-codey-layout-toggle", toggle);
+        // 保留原生控件，标签栏仅代理其动作，状态与图标由原生页面决定。
+        button.addEventListener("click", () => {
+          const fresh = [...document.querySelectorAll('button[data-app-shell-workspace-layout-toggle]')]
+            .find((node) => node.getAttribute("data-app-shell-workspace-layout-toggle") === toggle && sessionTabVisible(node));
+          fresh?.click();
+        });
+        actions.appendChild(button);
+      }
+      sessionTabsBar.appendChild(actions);
+    }
+    tabList.querySelector('[data-active="true"]')?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  };
+
+  const scan = (root = document, syncTitles = true, syncTabs = true) => {
     // Streaming output makes conversation turns by far the most frequent scan
     // root. Sidebar controls can never live inside a turn, so running their
     // installers there is a guaranteed-miss walk of the whole turn subtree.
@@ -3519,6 +3952,8 @@
     recoverHiddenRunningThreads(root);
     installMessageSelection(root);
     if (syncTitles) syncSidebarTitles(root);
+    if (syncTabs) syncSessionTabs();
+    return true;
   };
 
   window.__codeyBridge = callBridge;
@@ -3544,6 +3979,8 @@
   window.__codeyInstallMessageSelection = installMessageSelection;
 
   const codeyOwnedSelector = [
+    "#codey-session-tabs",
+    "[data-codey-chat-maximize]",
     rendererSettingsButtonSelector,
     `#${toolbarId}`,
     `#${toastId}`,
@@ -3637,7 +4074,12 @@
         candidateIndex,
       ) => candidateIndex !== index && candidate.contains?.(root)));
     pendingScanRoots.clear();
-    roots.forEach((root) => scan(root, true));
+    let syncTabs = false;
+    for (const root of roots) {
+      if (scan(root, true, false)) syncTabs = true;
+    }
+    // 全局标签同步每批只做一次；纯消息流更新仍跳过侧栏扫描。
+    if (syncTabs) syncSessionTabs();
   };
   const scheduleIncrementalScan = (root) => {
     if (disposed) return;
@@ -3700,6 +4142,13 @@
     codeyTimed("codey-inject.sessionToolMutations", mutations?.length ?? 0, () => handleSessionToolMutationsImpl(mutations));
   const handleSessionToolMutationsImpl = (mutations) => {
     if (disposed) return;
+    // 布局根不一定属于消息扫描边界；最大化状态每批直接同步一次。
+    if (mutations.some((mutation) => mutation.type === "attributes"
+      && (mutation.attributeName === "data-app-shell-workspace-layout"
+        || mutation.attributeName === "data-app-shell-main-titlebar"
+        || mutation.attributeName === "data-app-shell-right-panel-full-width"
+        || (mutation.attributeName === "aria-pressed"
+          && mutation.target?.hasAttribute?.("data-app-shell-workspace-layout-toggle"))))) syncSessionTabs();
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
@@ -3784,6 +4233,7 @@
     attributeOldValue: true,
     attributeFilter: [
       "aria-label",
+      "aria-pressed",
       "aria-expanded",
       "aria-hidden",
       "data-turn-key",
@@ -3796,6 +4246,11 @@
       "data-app-action-sidebar-thread-id",
       "data-app-action-sidebar-thread-kind",
       "data-app-action-sidebar-thread-title",
+      "data-app-action-sidebar-thread-active",
+      "data-app-shell-workspace-layout",
+      "data-app-shell-main-titlebar",
+      "data-app-shell-right-panel-full-width",
+      "data-above-composer-conversation-id",
       "data-app-action-sidebar-project-id",
       "data-app-action-sidebar-project-list-id",
       "data-app-action-sidebar-project-row",
@@ -3815,6 +4270,10 @@
   disposeInstall = () => {
     if (disposed) return;
     disposed = true;
+    window.clearTimeout(sessionTabNavigationTimer);
+    closeSessionTabMenu();
+    clearSessionTabsMount();
+    sessionTabs.clear();
     try { sessionToolObserver?.disconnect?.(); } catch {}
     for (const [target, type, handler, options] of installedListeners) {
       try { target.removeEventListener?.(type, handler, options); } catch {}

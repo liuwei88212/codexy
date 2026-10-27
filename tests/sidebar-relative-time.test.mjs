@@ -469,6 +469,26 @@ test("keeps running priority while a placeholder thread receives its canonical i
   assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
 });
 
+test("does not transfer running priority when a row is reused for another thread or host", () => {
+  for (const changeHost of [false, true]) {
+    const running = sidebarThreadEntry({ running: true, sessionId: "thread-original" });
+    const rows = [running.row];
+    const { window } = loadInjection({ rows });
+    running.spinner.remove();
+    if (changeHost) running.row.setAttribute("data-app-action-sidebar-thread-host-id", "other-host");
+    else running.row.setAttribute("data-app-action-sidebar-thread-id", "thread-other");
+    window.__codeyInstallThreadUpdatedTimes(running.row);
+    assert.equal(running.item.getAttribute("data-codey-thread-running"), null);
+
+    const original = sidebarThreadEntry({ sessionId: "thread-original" });
+    rows.push(original.row);
+    window.__codeyInstallThreadUpdatedTimes(original.row);
+    assert.equal(original.item.getAttribute("data-codey-thread-running"), "true");
+    original.nativeStatusRail.appendChild(original.spinner);
+    window.__codeyInstallThreadUpdatedTimes(original.row);
+  }
+});
+
 test("reveals a paginated running thread when its project is expanded", () => {
   const sessionId = "client-new-thread:hidden-running";
   const project = sidebarProjectList({ projectId: "project-running" });

@@ -819,6 +819,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portable_compaction_legacy_readable_history_uses_explicit_target() {
+        for compacted in [false, true] {
+            let (router, upstream, _source, target, _model) = fixture().await;
+            let target_alias = model_alias(&target, "target-model");
+            let home = cold_native_history("gpt-6-astra", &target_alias);
+            let history = json!({"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"readable history"}
+            ]});
+            let records = [
+                json!({"type":"session_meta","payload":{"id":"parent","model_provider":"openai"}}),
+                if compacted {
+                    json!({"type":"compacted","payload":{"replacement_history":[history],
+                        "resume_metadata":{"previous_turn_settings":{"model":"gpt-6-astra"}}}})
+                } else {
+                    json!({"type":"response_item","payload":history})
+                },
+            ];
+            std::fs::write(
+                home.path().join("session.jsonl"),
+                records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"),
+            )
+            .unwrap();
+            let before = std::fs::read(home.path().join("session.jsonl")).unwrap();
+            let prepared = router
+                .portable_compaction_from_home(
+                    "prepare",
+                    &json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"}),
+                    home.path(),
+                )
+                .unwrap();
+            assert_eq!(prepared["required"], false);
+            let mock = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await.unwrap();
+                assert_eq!(
+                    incoming_header(&request, "authorization"),
+                    Some("Bearer sk-target")
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["model"], "target-model");
+                assert_eq!(body["input"][0]["content"][0]["text"], "readable history");
+                write_json_response(&mut socket, 200, &json!({"id":"continued","output":[]}))
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(
+                post(&client(), &router, "parent", &target_alias,
+                    json!([{"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":"readable history"}
+                    ]},{"role":"user","content":"continue"}]))
+                    .send().await.unwrap().status().as_u16(),
+                200
+            );
+            // 继续发送不改写原始历史，也不需要恢复旧账号。
+            assert_eq!(std::fs::read(home.path().join("session.jsonl")).unwrap(), before);
+            mock.await.unwrap();
+            router.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn portable_compaction_cold_source_never_falls_back_or_overwrites_active_binding() {
         let (router, _upstream, source, target, model) = fixture().await;
         let payload =

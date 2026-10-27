@@ -121,6 +121,7 @@ export type Config = {
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
   modelContextByProvider?: Record<string, Record<string, ModelContextConfig>>;
+  modelDefaultReasoningEffortsByProvider?: Record<string, Record<string, string>>;
   modelReasoningEffortsByProvider?: Record<
     string,
     Record<string, ModelReasoningEffort[]>

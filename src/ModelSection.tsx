@@ -115,6 +115,7 @@ type ModelSectionProps = {
       baseUrl: string;
       maxConcurrency: number;
     },
+    modelDefaultReasoningEfforts?: Record<string, string>,
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
   onConfigChange?: (config: Config) => void;
@@ -278,6 +279,7 @@ function ModelSectionComponent({
   const [headerDialogProfile, setHeaderDialogProfile] = useState<Profile | null>(null);
   const [headerError, setHeaderError] = useState("");
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
+  const [officialReasoningDraft, setOfficialReasoningDraft] = useState<Record<string, string>>({});
   const [officialModelContextDraft, setOfficialModelContextDraft] =
     useState<Record<string, ModelContextConfig>>({});
   const [officialAccounts, setOfficialAccounts] = useState<OfficialAccount[] | null>(null);
@@ -562,9 +564,13 @@ function ModelSectionComponent({
       setOfficialModelContextDraft(
         config.modelContextByProvider?.[providerId] || {},
       );
+      setOfficialReasoningDraft(Object.fromEntries(Object.entries(
+        config.modelDefaultReasoningEffortsByProvider?.[providerId] ?? {},
+      ).map(([model, value]) => [modelKey(model), value])));
     } else {
       setOfficialModelDraft([]);
       setOfficialModelContextDraft({});
+      setOfficialReasoningDraft({});
     }
     setOfficialDialogScope(official ? officialScope : null);
     resetRouteImport();
@@ -728,6 +734,10 @@ function ModelSectionComponent({
                     maxConcurrency: Number(officialRouteDraft.maxConcurrency.trim()),
                   }
                 : undefined,
+              officialDialogScope === "models" ? Object.fromEntries(
+                officialModelDraft.flatMap((model) => officialReasoningDraft[modelKey(model)]
+                  ? [[model, officialReasoningDraft[modelKey(model)]]] : []),
+              ) : undefined,
             )
           : true)
       : await onSaveRoute({ ...routeDraft, modelRequestHeaders });
@@ -1661,6 +1671,11 @@ function ModelSectionComponent({
                                 <ModelSettingsFields
                                   model={model}
                                   disabled={isBusy}
+                                  defaultReasoning={{
+                                    value: officialReasoningDraft[modelKey(model)] ?? "",
+                                    supportedLevels: modelState.officialModels.find((entry) => modelIdsEqual(entry.slug, model))?.supportedReasoningEfforts ?? [],
+                                    onChange: (value) => setOfficialReasoningDraft((current) => ({ ...current, [modelKey(model)]: value })),
+                                  }}
                                   policy={Object.entries(officialModelContextDraft).find(
                                     ([candidate]) => modelIdsEqual(candidate, model),
                                   )?.[1]}

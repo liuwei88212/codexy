@@ -59,6 +59,8 @@ type ModelPickerDialogProps = {
   modelState: ModelState;
   draftModelSet: Set<string>;
   draftModelContexts: Record<string, ModelContextConfig>;
+  draftModelDefaultReasoningEfforts: Record<string, string>;
+  onUpdateDraftModelDefaultReasoningEffort: (model: string, value: string) => void;
   draftReasoningEfforts: Record<string, ModelReasoningEffort[]>;
   reasoningEffortAutoByModel: Record<string, ModelReasoningEffort[]>;
   onUpdateDraftModelContext: (model: string, policy: ModelContextConfig | undefined) => void;
@@ -94,6 +96,8 @@ function ModelPickerDialogComponent({
   modelState,
   draftModelSet,
   draftModelContexts,
+  draftModelDefaultReasoningEfforts = {},
+  onUpdateDraftModelDefaultReasoningEffort,
   draftReasoningEfforts,
   reasoningEffortAutoByModel,
   onUpdateDraftModelContext,
@@ -326,6 +330,11 @@ function ModelPickerDialogComponent({
                     <strong className="break-words text-xs font-semibold text-[var(--codey-text,#1d1d1f)]">{model.displayName}</strong>
                   </div>
                   {!routeConfigReadOnly && <ModelSettingsFields model={model.slug} policy={draftModelContexts[model.slug]} disabled={isBusy}
+                    defaultReasoning={{
+                      value: draftModelDefaultReasoningEfforts[modelKey(model.slug)] ?? "",
+                      supportedLevels: model.supportedReasoningEfforts ?? [],
+                      onChange: (value) => onUpdateDraftModelDefaultReasoningEffort(model.slug, value),
+                    }}
                     onChange={(policy) => onUpdateDraftModelContext(model.slug, policy)} />}
                 </div>
               ))}
@@ -408,6 +417,11 @@ function ModelPickerDialogComponent({
                     model={model}
                     disabled={isBusy}
                     policy={draftModelContexts[model]}
+                    defaultReasoning={{
+                      value: draftModelDefaultReasoningEfforts[key] ?? "",
+                      supportedLevels: (draftReasoningEfforts[key] ?? reasoningEffortAutoByModel[key] ?? []).map((effort) => effort.level),
+                      onChange: (value) => onUpdateDraftModelDefaultReasoningEffort(model, value),
+                    }}
                     onChange={(policy) => onUpdateDraftModelContext(model, policy)}
                     reasoning={{
                       efforts: draftReasoningEfforts[key] ?? [],

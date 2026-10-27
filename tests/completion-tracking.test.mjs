@@ -189,6 +189,8 @@ function loadInjection({
   }
   const document = {
     documentElement,
+    addEventListener() {},
+    removeEventListener() {},
     body: documentBody,
     scripts: managerModule ? [{ src: managerAssetUrl }] : [],
     visibilityState: "visible",
@@ -249,6 +251,7 @@ function loadInjection({
     __codeyCodexSessionController: codexSessionController,
     __codeyCodexSignalDispatcher: codexSignalDispatcher,
     addEventListener: () => {},
+    removeEventListener: () => {},
     alert: (message) => alerts.push(String(message)),
     clearTimeout: () => {},
     confirm: (message) => {

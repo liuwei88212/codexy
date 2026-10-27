@@ -55,6 +55,19 @@ fn main() {
 #[cfg(windows)]
 fn embed_windows_icon() {
     let mut resource = winres::WindowsResource::new();
+    // 便携 SDK 未写入系统注册表时，沿用构建进程显式指定的 SDK 路径。
+    if let (Ok(sdk), Ok(version)) = (
+        std::env::var("WindowsSdkDir"),
+        std::env::var("WindowsSDKVersion"),
+    ) {
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else {
+            "x86"
+        };
+        let toolkit = Path::new(&sdk).join("bin").join(version).join(arch);
+        resource.set_toolkit_path(toolkit.to_str().expect("Windows SDK 路径无法转换为 UTF-8"));
+    }
     resource.set_icon("icons/Codey.ico").set_manifest(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

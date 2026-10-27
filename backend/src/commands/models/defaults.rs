@@ -53,11 +53,12 @@ pub async fn save_default_model(
     })))
 }
 
-// 官方模型允许调整本地上下文预算，思考强度仍沿用官方目录。
+// 官方模型的默认推理强度只能从目录支持的档位中选择。
 pub struct OfficialRouteModelSave {
     pub route_id: String,
     pub models: Vec<String>,
     pub model_contexts: Option<BTreeMap<String, crate::config::ModelContextConfig>>,
+    pub model_default_reasoning_efforts: Option<BTreeMap<String, String>>,
     pub enabled: Option<bool>,
     pub show_account_usage: Option<bool>,
     pub upstream_proxy: Option<String>,
@@ -76,6 +77,7 @@ pub async fn save_official_route_models(
         route_id,
         models: requested_models,
         model_contexts: requested_model_contexts,
+        model_default_reasoning_efforts,
         enabled: requested_enabled,
         show_account_usage: requested_show_account_usage,
         upstream_proxy: requested_upstream_proxy,
@@ -139,13 +141,14 @@ pub async fn save_official_route_models(
     if let Some(show_usage) = requested_show_account_usage {
         config.show_account_usage_in_header = show_usage;
     }
-    let official_models = config
-        .upstream_models_by_provider
-        .get(&provider_id)
-        .filter(|models| !models.is_empty())
-        .cloned()
-        .unwrap_or_else(model_catalog::default_official_model_slugs);
+    let official_models = official_model_ids_for_provider(&config, &provider_id, codex_home())?;
     let selected_models = ordered_official_selection(&official_models, &requested_models)?;
+    set_model_default_reasoning_efforts(
+        &mut config,
+        &provider_id,
+        model_default_reasoning_efforts.as_ref(),
+        &official_models,
+    )?;
     set_model_contexts(
         &mut config,
         &provider_id,
@@ -256,6 +259,29 @@ pub async fn save_official_route_models(
         response,
         subagent_hot_reload,
     ))
+}
+
+pub(crate) fn official_model_ids_for_provider(
+    config: &CodeyConfig,
+    provider_id: &str,
+    home: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    // 保存与选择器共用动态目录，离线时仍保留账号快照中的新模型及线路范围限制。
+    model_catalog::selection_state_in_context(
+        home,
+        true,
+        config
+            .upstream_models_by_provider
+            .get(provider_id)
+            .map(Vec::as_slice),
+        &[],
+        &[],
+        None,
+        None,
+        &model_catalog::CatalogContext::new(&config.codex_app_path),
+    )
+    .map(|state| state.official_model_ids)
+    .map_err(|error| error.to_string())
 }
 
 /// 官方线路启用的模型按请求顺序保存，线路卡片和选择器都按这个顺序显示；

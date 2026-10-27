@@ -771,6 +771,8 @@ fn local_route_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> boo
         || previous.upstream_models_by_provider != next.upstream_models_by_provider
         || previous.model_reasoning_efforts_by_provider != next.model_reasoning_efforts_by_provider
         || previous.model_context_by_provider != next.model_context_by_provider
+        || previous.model_default_reasoning_efforts_by_provider
+            != next.model_default_reasoning_efforts_by_provider
         || previous.default_model != next.default_model
         || previous.initial_route_import_completed != next.initial_route_import_completed
 }
@@ -2190,6 +2192,9 @@ fn retain_route_scoped_config(config: &mut CodeyConfig) {
                 .to_string()
         })
         .collect::<std::collections::HashSet<_>>();
+    config
+        .model_default_reasoning_efforts_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
     config
         .model_context_by_provider
         .retain(|provider_id, _| provider_ids.contains(provider_id));

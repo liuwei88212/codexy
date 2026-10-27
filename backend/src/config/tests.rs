@@ -719,6 +719,52 @@ fn runtime_catalog_and_router_share_route_membership_and_capabilities() {
 }
 
 #[test]
+fn default_reasoning_effort_follows_route_model_and_clear() {
+    let mut first = ProviderProfile::new("First");
+    first.id = "first".into();
+    first.base_url = "https://first.example/v1".into();
+    first.normalize();
+    let mut second = first.clone();
+    second.id = "second".into();
+    let mut config = CodeyConfig {
+        profiles: vec![first, second],
+        ..CodeyConfig::default()
+    };
+    for provider in ["first", "second"] {
+        config
+            .selected_models_by_provider
+            .insert(provider.into(), vec!["shared".into()]);
+        config
+            .upstream_models_by_provider
+            .insert(provider.into(), vec!["shared".into()]);
+    }
+    config.model_default_reasoning_efforts_by_provider.insert(
+        "first".into(),
+        BTreeMap::from([("SHARED".into(), "high".into())]),
+    );
+    config.model_default_reasoning_efforts_by_provider.insert(
+        "second".into(),
+        BTreeMap::from([("shared".into(), "low".into())]),
+    );
+    config.default_model = config
+        .model_target_for_route("first", "shared")
+        .unwrap()
+        .alias;
+    assert_eq!(config.default_model_reasoning_effort(), Some("high"));
+    config.default_model = config
+        .model_target_for_route("second", "shared")
+        .unwrap()
+        .alias;
+    assert_eq!(config.default_model_reasoning_effort(), Some("low"));
+    config
+        .model_default_reasoning_efforts_by_provider
+        .remove("second");
+    assert_eq!(config.default_model_reasoning_effort(), None);
+    config.retain_model_contexts("first", &[]);
+    assert!(config.model_default_reasoning_efforts_by_provider["first"].is_empty());
+}
+
+#[test]
 fn loading_legacy_protocol_keeps_read_compatibility_without_rewriting_file() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.json");

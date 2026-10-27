@@ -670,6 +670,9 @@ pub struct CodeyConfig {
     pub selected_models_by_provider: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub model_context_by_provider: BTreeMap<String, BTreeMap<String, ModelContextConfig>>,
+    /// 各线路模型的新会话默认推理强度；缺席时沿用运行时默认值。
+    #[serde(default)]
+    pub model_default_reasoning_efforts_by_provider: BTreeMap<String, BTreeMap<String, String>>,
     /// User-declared thinking levels for third-party route models, keyed by
     /// provider then model. An entry replaces the automatic template list; the
     /// value of each level is the string declared to Codex and sent upstream.
@@ -854,6 +857,7 @@ impl Default for CodeyConfig {
             user_scripts: Vec::new(),
             selected_models_by_provider: BTreeMap::new(),
             model_context_by_provider: BTreeMap::new(),
+            model_default_reasoning_efforts_by_provider: BTreeMap::new(),
             model_reasoning_efforts_by_provider: BTreeMap::new(),
             manual_third_party_models_by_provider: BTreeMap::new(),
             declared_official_models_by_provider: BTreeMap::new(),
