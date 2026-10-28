@@ -750,6 +750,10 @@
       [data-codey-session-actions] { display: flex !important; align-items: center; flex-wrap: nowrap; }
       [data-codey-session-title-row] { flex: 1 1 0% !important; min-width: 0 !important; width: auto !important; overflow: hidden; }
       [data-codey-session-title-row] [data-thread-title] { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      /* 原生空操作占位与独立操作栏不能重复占宽；时间在操作时也要释放空间。 */
+      [data-codey-session-title-row] > div:empty[class*="justify-end"] { min-width: 0 !important; width: 0 !important; margin-inline: 0 !important; }
+      [data-codey-session-actions]:hover [${threadUpdatedAtAttribute}],
+      [data-codey-session-actions]:focus-within [${threadUpdatedAtAttribute}] { display: none; }
       [data-codey-session-action-row] { display: none !important; position: static !important; transform: none !important; align-items: center !important; flex: 0 0 auto !important; flex-flow: row nowrap !important; gap: 1px !important; width: auto !important; min-width: max-content !important; height: auto !important; white-space: nowrap !important; visibility: hidden; pointer-events: none !important; }
       [data-codey-session-action-row] button { pointer-events: none !important; }
       [data-codey-session-actions]:hover [data-codey-session-action-row],
@@ -1321,6 +1325,9 @@
     ));
     for (const candidate of candidates) {
       if (nativeElementLooksLikeThreadStatus(candidate)) return true;
+      // 快捷键提示与时间共用尾部区域，优先展示原生提示，但不把它当运行状态。
+      if (candidate.matches?.("kbd") || candidate.querySelector?.("kbd")
+        || /(?:Alt|Ctrl|Control|Option|⌥|⌘)\s*[+＋]?\s*[1-9]/i.test(candidate.textContent || "")) return true;
     }
     return false;
   };

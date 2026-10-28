@@ -296,6 +296,28 @@ test("hides thread time while the native status rail is occupied", () => {
   );
 });
 
+test("native shortcut badges replace time without marking the thread as running", () => {
+  const { window } = loadInjection();
+  const row = new FakeElement();
+  const content = new FakeElement();
+  content.className = "flex h-full w-full items-center";
+  const title = new FakeElement();
+  title.className = "flex min-w-0 flex-1 items-center";
+  const rail = new FakeElement();
+  content.appendChild(title);
+  content.appendChild(rail);
+  row.appendChild(content);
+  const timestamp = Date.now() - 60_000;
+  for (const text of ["Alt+7", "⌥+8", "Ctrl+9"]) {
+    rail.textContent = text;
+    window.__codeyUpdateThreadUpdatedAt(row, timestamp);
+    assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
+  }
+  rail.textContent = "";
+  window.__codeyUpdateThreadUpdatedAt(row, timestamp);
+  assert.ok(content.querySelector("[data-codey-thread-updated-at]"));
+});
+
 test("hides thread time from Codex React loading and unread status state", () => {
   const { window } = loadInjection();
   const row = new FakeElement();
