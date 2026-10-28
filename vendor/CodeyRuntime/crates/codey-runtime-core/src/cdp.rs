@@ -186,7 +186,12 @@ pub fn is_avatar_overlay_page_target(target: &CdpTarget) -> bool {
 
 /// 页面地址是否属于 Codex 的辅助窗口。也用于注入后按页面实际地址复核目标。
 pub fn is_auxiliary_codex_window_url(url: &str) -> bool {
-    auxiliary_codex_window_route(url).is_some()
+    let (path, query) = split_app_url(url);
+    // 官网承载窗口不能安装 Codex 会话增强，也不能在主窗口关闭后被选为主页面。
+    let chatgpt_window = path.eq_ignore_ascii_case("app://-/index.html")
+        && query_param(query, "initialRoute")
+            .is_some_and(|route| split_app_url(&route).0 == "/plugins/codey-chatgpt-window");
+    chatgpt_window || auxiliary_codex_window_route(url).is_some()
 }
 
 /// 辅助窗口既可能以 `index.html?initialRoute=/x` 打开，也可能使用独立文档

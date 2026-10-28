@@ -29,6 +29,7 @@ use crate::error_log;
 
 /// 补丁脚本注入页面后暴露的纯函数入口：`(url, source) => patched | null`。
 const RENDERER_ASSET_PATCH_SCRIPT: &str = include_str!("renderer_asset_patch.js");
+const CHATGPT_WINDOW_SCRIPT: &str = include_str!("../../public/chatgpt-window.js");
 /// 需要改写的脚本名前缀，与页面侧 isCodexRendererAssetUrl 的名单保持一致。
 const PATCHABLE_ASSET_PREFIXES: [&str; 3] = ["app-initial", "app-primary", "app-shared"];
 /// 仅在关闭宠物时改写的设置页脚本。
@@ -62,7 +63,7 @@ fn service_slot() -> &'static Mutex<Option<ServiceHandle>> {
 pub(crate) fn renderer_asset_patch_document_script(disable_pet: bool) -> String {
     let options = json!({ "disablePet": disable_pet });
     format!(
-        "globalThis.__CODEY_RENDERER_PATCH_OPTIONS__ = {options};\n{RENDERER_ASSET_PATCH_SCRIPT}"
+        "globalThis.__CODEY_RENDERER_PATCH_OPTIONS__ = {options};\n{RENDERER_ASSET_PATCH_SCRIPT}\n{CHATGPT_WINDOW_SCRIPT}"
     )
 }
 

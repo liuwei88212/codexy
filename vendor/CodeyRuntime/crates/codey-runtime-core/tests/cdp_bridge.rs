@@ -364,6 +364,7 @@ fn auxiliary_window_urls_cover_route_and_document_forms() {
         "app://-/detached-window.html?initialRoute=%2Fdetached-window",
         "app://-/detached-window.html",
         "APP://-/avatar-overlay",
+        "app://-/index.html?initialRoute=%2Fplugins%2Fcodey-chatgpt-window%3FaccountId%3Dtest-account",
     ] {
         assert!(is_auxiliary_codex_window_url(url), "{url}");
     }
@@ -371,12 +372,39 @@ fn auxiliary_window_urls_cover_route_and_document_forms() {
         "app://-/index.html",
         "app://-/index.html?initialRoute=%2Flocal%2Fthread-1",
         "app://-/index.html?initialRoute=%2Fsettings",
+        "app://-/index.html?initialRoute=%2Fplugins%2Fcodey-chatgpt-window-other",
         "https://example.test/detached-window.html",
         "about:blank",
         "",
     ] {
         assert!(!is_auxiliary_codex_window_url(url), "{url}");
     }
+}
+
+#[test]
+fn chatgpt_window_is_never_selected_for_codex_injection() {
+    let chatgpt = target(
+        "chatgpt",
+        "page",
+        "ChatGPT",
+        "app://-/index.html?initialRoute=%2Fplugins%2Fcodey-chatgpt-window%3FaccountId%3Dtest-account",
+        Some("ws://chatgpt"),
+    );
+    assert!(!is_primary_codex_page_target(&chatgpt));
+    assert!(pick_injectable_codex_page_target(&[chatgpt.clone()]).is_err());
+    let main = target(
+        "main",
+        "page",
+        "Codex",
+        "app://-/index.html",
+        Some("ws://main"),
+    );
+    assert_eq!(
+        pick_injectable_codex_page_target(&[chatgpt, main])
+            .unwrap()
+            .id,
+        "main"
+    );
 }
 
 #[test]
