@@ -25,24 +25,16 @@ pub(crate) struct CodexLaunchProxy {
 
 /// `resolve` 的产物：无凭据地址直连上游，带凭据地址经本地认证中继。
 pub(crate) enum LaunchProxyPlan {
-    /// 直连上游，`upstream` 仅用于启动前的可达性探活。
-    Direct {
-        proxy: CodexLaunchProxy,
-        upstream: crate::launch_proxy_relay::UpstreamProxy,
-    },
+    /// 无凭据地址直接交给客户端，上游连接在实际请求时建立。
+    Direct { proxy: CodexLaunchProxy },
     Relayed(crate::launch_proxy_relay::UpstreamProxy),
 }
 
 impl LaunchProxyPlan {
-    /// 启动入口：先对上游做探活——代理不可达时立刻报错，而不是让 Codex
-    /// 带着死代理静默挂起；带凭据的上游再启动回环认证中继，Codex 侧拿到
-    /// 的始终是无凭据地址。
+    /// 启动不依赖上游可达，保证代理失效后仍能打开控制台修正配置。
     pub(crate) async fn start(self) -> anyhow::Result<CodexLaunchProxy> {
         match self {
-            Self::Direct { proxy, upstream } => {
-                crate::launch_proxy_relay::preflight(&upstream).await?;
-                Ok(proxy)
-            }
+            Self::Direct { proxy } => Ok(proxy),
             Self::Relayed(upstream) => {
                 let port = crate::launch_proxy_relay::ensure_running(&upstream).await?;
                 Ok(CodexLaunchProxy::relayed(port))
@@ -70,7 +62,6 @@ impl CodexLaunchProxy {
         }
         Ok(Some(LaunchProxyPlan::Direct {
             proxy: Self::from_parsed(value, &url),
-            upstream,
         }))
     }
 
@@ -219,6 +210,31 @@ pub(crate) fn merge_loopback_no_proxy(existing: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_upstream_does_not_block_startup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        for url in [
+            format!("http://{address}"),
+            format!("socks5://user:pass@{address}"),
+        ] {
+            let proxy = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                CodexLaunchProxy::resolve(&url).unwrap().unwrap().start(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!proxy.chromium_argument().contains("user:pass"));
+            assert!(
+                proxy.environment().iter().all(|(_, value)| !value.contains("user:pass"))
+            );
+        }
+    }
 
     fn resolve_direct(value: &str) -> CodexLaunchProxy {
         match CodexLaunchProxy::resolve(value).unwrap().unwrap() {
@@ -373,8 +389,7 @@ mod tests {
         set_active(None);
         let environment =
             resolve_shared_environment(|| "http://user:pass@127.0.0.1:9".to_string()).await;
-        // 上游不可达时中继起不来：宁可不注入代理变量，也不把凭据交给该
-        // app-server 及其子进程。
+        // 上游不可达仍提供本地中继，凭据始终只保留在中继内部。
         assert!(
             environment
                 .iter()

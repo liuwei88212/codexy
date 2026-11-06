@@ -185,6 +185,87 @@ test("draft default patch is atomic when anchors drift and idempotent when reapp
   }
 });
 
+// Codex 26.1021+ stores manual draft choices natively and passes them to the
+// settings hook as draftModelSettings; only the initial reasoning changes.
+const nativeDraftFixture = [
+  "let Dfa=bn(V,e=>({isManuallyChanged:!1,modelSettings:null,serviceTier:null}));",
+  "function Cfa(e){return{...e,modelSettings:null,modelSettingsPersistAsDefault:void 0}}",
+  "function klo({userSavedModelString:e,userSavedReasoningEffort:t,listModelsData:n}){let r=n?.models.find(m=>m.model===e),i=r?.supportedReasoningEfforts?.map(e=>e.reasoningEffort),a=t!=null&&i!=null&&i.includes(t)?t:r?.defaultReasoningEffort;return{model:r?r.model:e,reasoningEffort:a??t??`medium`,profile:null,isLoading:!1}}",
+  "function Llo(e){let t=(0,A2.c)(32),{hostId:n,managedNewThreadModelSettings:s,draftModelSettings:c,waitForModelList:l,isNewThreadDraft:d}=e,z=Cat(n),I=s?.model??null,ne=I==null?Saved().reasoningEffort:s?.modelReasoningEffort??null,ae=klo({userSavedModelString:I??Saved().model,userSavedReasoningEffort:ne,listModelsData:l&&z!=null?{...z,defaultModel:z.models[0]}:z}),me={...ae,isLoading:!1};c!=null&&(me={...me,model:c.model,reasoningEffort:c.reasoningEffort});return{modelSettings:me}}",
+  "function afterLlo(){}",
+].join("");
+
+test("native draft settings start at supported medium reasoning and ordinary speed", async (t) => {
+  (0, eval)(await loadStartupPatchTemplate());
+  const errors = [];
+  const savedLog = globalThis.__codeyPatchLog;
+  globalThis.__codeyPatchLog = (record) => errors.push(JSON.parse(record));
+  let patched;
+  try {
+    patched = globalThis.__codeyRendererPatchEntry("app://-/assets/app-initial-native-drafts.js", nativeDraftFixture);
+  } finally {
+    globalThis.__codeyPatchLog = savedLog;
+  }
+  assert.deepEqual(errors, []);
+  assert.ok(patched?.includes("/*codey-new-thread-draft-defaults*/"));
+  const syntax = spawnSync(process.execPath, ["--check", "--input-type=module"], { input: patched, encoding: "utf8" });
+  assert.equal(syntax.status, 0, syntax.stderr);
+  const factory = patched.match(/=>\(\{isManuallyChanged:!1,modelSettings:null,serviceTier:\{value:`default`\}\}\)/)?.[0];
+  assert.ok(factory, "each draft starts with ordinary speed");
+
+  const state = {
+    saved: { model: "chosen-model", reasoningEffort: "high" },
+    catalog: {
+      models: [
+        { model: "chosen-model", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
+        { model: "high-only", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+      ],
+    },
+  };
+  const start = patched.indexOf("function Llo(");
+  const useSettings = Function("A2", "Cat", "Saved", `${patched.slice(start, patched.indexOf("function afterLlo"))}${patched.slice(patched.indexOf("function klo("), patched.indexOf("function Llo("))}return Llo`)(
+    { c: (size) => Array(size) },
+    () => state.catalog,
+    () => state.saved,
+  );
+  const effort = (options) => useSettings({ hostId: "local", waitForModelList: true, ...options }).modelSettings.reasoningEffort;
+
+  await t.test("a new draft ignores the saved reasoning", () => {
+    assert.equal(effort({ isNewThreadDraft: true }), "medium");
+    assert.equal(useSettings({ hostId: "local", isNewThreadDraft: true }).modelSettings.model, "chosen-model");
+  });
+  await t.test("manual draft choices, managed settings and existing threads stay native", () => {
+    assert.equal(effort({ isNewThreadDraft: true, draftModelSettings: { model: "chosen-model", reasoningEffort: "high" } }), "high");
+    assert.equal(effort({ isNewThreadDraft: true, managedNewThreadModelSettings: { model: "chosen-model", modelReasoningEffort: "high" } }), "high");
+    assert.equal(effort({ isNewThreadDraft: false }), "high");
+    assert.equal(effort({}), "high");
+  });
+  await t.test("unsupported medium and unknown models use the native result", () => {
+    state.saved = { model: "high-only", reasoningEffort: "high" };
+    assert.equal(effort({ isNewThreadDraft: true }), "high");
+    state.saved = { model: "not-in-catalog", reasoningEffort: "low" };
+    assert.equal(effort({ isNewThreadDraft: true }), "low");
+    state.catalog = undefined;
+    assert.equal(effort({ isNewThreadDraft: true }), "low");
+  });
+
+  const patch = (source) => globalThis.__codeyRendererPatchEntry("app://-/assets/app-initial-native-drafts.js", source) ?? source;
+  assert.equal(patch(patched), patched, "reapplying is idempotent");
+  globalThis.__codeyPatchLog = () => {};
+  const savedError = console.error;
+  console.error = () => {};
+  try {
+    for (const source of [
+      nativeDraftFixture.replace("serviceTier:null", "serviceTier:void 0"),
+      `${nativeDraftFixture}function Mlo(e){let t=(0,A2.c)(1),{managedNewThreadModelSettings:s,draftModelSettings:c,isNewThreadDraft:d}=e,x=1}`,
+      nativeDraftFixture.replace("me={...ae,", "me={...klo({userSavedModelString:null}),...ae,"),
+    ]) assert.equal(patch(source), source, "drifted anchors leave the asset untouched");
+  } finally {
+    globalThis.__codeyPatchLog = savedLog;
+    console.error = savedError;
+  }
+});
+
 test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
   const patchRecords = [];
   const patchErrors = [];
@@ -785,6 +866,32 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.deepEqual(collectedReasons, ["main_thread_jank"]);
     assert.deepEqual(snapshotResponses, ["jank"]);
 
+    // Codex 26.1021 moved the handler into the host services chunk and uses an
+    // unlabelled switch break; a skipped heartbeat must not send workRoute.
+    const hostServicesSnapshotSource = [
+      "async function onHostMessage(e,t,tt){switch(e.type){",
+      "case`electron-app-state-snapshot-request`:{let n=t.get(`host`,e.hostId),r=t.get(`sampler`),i=null;",
+      "if(n!=null&&r!=null){let[a]=await Promise.all([r.collectAppStateSnapshot(e.hostId,e.reason)]);i=a}",
+      "let a=t.get(`route`);if(i==null&&a==null)break;",
+      "tt.dispatchMessage(`electron-app-state-snapshot-response`,{requestId:e.requestId,fields:i,workRoute:a});break}",
+      "case`other`:break}}",
+    ].join("");
+    const onHostMessage = Function(
+      `${patch("app://-/assets/initialize-app-host-services-5891c906a171.js", hostServicesSnapshotSource)};return onHostMessage`,
+    )();
+    collectedReasons.length = 0;
+    snapshotResponses.length = 0;
+    for (const [requestId, reason] of [["beat", "heartbeat"], ["jank", "main_thread_jank"]]) {
+      await onHostMessage({
+        type: "electron-app-state-snapshot-request",
+        hostId: "local",
+        requestId,
+        reason,
+      }, snapshotStore, snapshotBridge);
+    }
+    assert.deepEqual(collectedReasons, ["main_thread_jank"]);
+    assert.deepEqual(snapshotResponses, ["jank"]);
+
     // 只有首个不兼容模块触发两项跳过，其余夹具全部按现行形态改写。
     assert.equal(patchErrors.length, 2);
     assert.equal(patchRecords.length, 2);
@@ -824,4 +931,88 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       globalThis.__codeyPatchLog = nativePatchLog;
     }
   }
+});
+
+test("slim pet stops the hidden avatar overlay prewarm without blocking on-demand voice", async () => {
+  const runtimeSource = [
+    "function eJ(){let O=Y(`2635985366`),t=tJ(),s=Co(),Be=Cf();",
+    "(0,nJ.useEffect)(()=>{s||jr.dispatchMessage(`electron-avatar-overlay-restore-ready`,{onDemandEnabled:O,shouldPrewarmAvatarOverlay:t&&Be})},[O,t,s,Be]);}",
+  ].join("");
+  const url = "app://-/assets/app-runtime-aa2c0a69096f.js";
+  for (const disablePet of [true, false]) {
+    delete globalThis.__codeyRendererPatchInstalled;
+    (0, eval)(await loadStartupPatchTemplate({ disablePet }));
+    const patched = globalThis.__codeyRendererPatchEntry(url, runtimeSource);
+    if (!disablePet) {
+      assert.equal(patched, null, "app-runtime is only intercepted for the slim pet");
+      continue;
+    }
+    assert.match(patched, /\{onDemandEnabled:O,shouldPrewarmAvatarOverlay:!1\}/);
+    assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, "the patch is idempotent");
+  }
+});
+
+test("checkout webviews load on demand instead of prewarming hidden pages", async () => {
+  delete globalThis.__codeyRendererPatchInstalled;
+  (0, eval)(await loadStartupPatchTemplate({ disablePet: false }));
+  const url = "app://-/assets/webview-page-71976c9e9730.js";
+  const pricing = "function ue(a,s,c,h,l,p,_,C){let O;e[9]!==a?(O=!re()&&a===`chatgpt`&&!s&&c!=null&&!h&&l?.structure===`personal`&&ee(p,He,{disableExposureLog:!0}).get(`use_embedded_checkout`,!1)?_e({currentPlan:ye(l.plan_type),url:_()}):null,e[9]=a,e[16]=O):O=e[16];let A=C??O;return(0,X.jsx)(me,{forcePricingRefreshInBackground:!0,search:A})}";
+  const credit = "function U(y,eligible){let T,E,Y={useLayoutEffect(){}},re=()=>!eligible,ee=()=>({get:()=>eligible}),d,He;if((0,Y.useLayoutEffect)(T,E),!y&&(re()||!ee(d,He,{disableExposureLog:!0}).get(`use_embedded_credit_checkout`,!1)))return null;let N=!y;return{isPrewarm:N}}";
+  const patched = globalThis.__codeyRendererPatchEntry(url, `${pricing}${credit}`);
+  assert.match(patched, /\(O=null,e\[9\]=a,e\[16\]=O\)/, "no background pricing search without a pricing route");
+  assert.match(patched, /let A=C\?\?O;/, "an opened pricing route still drives the native webview");
+  const creditGate = Function(`${patched.slice(patched.indexOf("function U("))};return U`)();
+  assert.equal(creditGate(false, true), null, "an eligible account no longer mounts the hidden credit page");
+  assert.deepEqual({ ...creditGate(true, true) }, { isPrewarm: false }, "a presented credit page still loads");
+  assert.deepEqual({ ...creditGate(true, false) }, { isPrewarm: false });
+  assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, "the patch is idempotent");
+});
+
+test("the hosted AppServerManager service leaves a diagnostic marker when it connects", async () => {
+  delete globalThis.__codeyRendererPatchInstalled;
+  (0, eval)(await loadStartupPatchTemplate({ disablePet: false }));
+  const url = "app://-/assets/renderer-app-server-managers-8103218e001d.js";
+  const source = "function im(e){let t=A.appServerManagers;if(t==null)throw Error(`Desktop host did not provide its AppServerManager service`);return tm(e,t)}";
+  const patched = globalThis.__codeyRendererPatchEntry(url, source);
+  const connect = (service) => Function("A", "tm", `${patched};return im`)({ appServerManagers: service }, () => "connected");
+  delete globalThis.__codeyAppServerManagerHosted;
+  assert.throws(() => connect(null)(), /did not provide/);
+  assert.equal(globalThis.__codeyAppServerManagerHosted, undefined, "a missing host service is not marked");
+  assert.equal(connect({})(), "connected");
+  assert.equal(globalThis.__codeyAppServerManagerHosted, true);
+  delete globalThis.__codeyAppServerManagerHosted;
+  assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, "the patch is idempotent");
+});
+
+test("hosted composer sends pass through the portable handoff gate", async () => {
+  delete globalThis.__codeyRendererPatchInstalled;
+  (0, eval)(await loadStartupPatchTemplate({ disablePet: false }));
+  const followUp = "async function f(e,n,i,o){let l=d(e,n),m=null;return f=await l.sendFollowUpMessage(i,{...o,useUserMessageAdmission:c(e,n),writingBlockContextPrepared:m!=null}),f}";
+  const turnStart = "async function f(e,n,r,a){let c=d(e,n);return await c.startTurn(r,{...a,context:{...a.context,onRequestDispatched:a.context?.onRequestDispatched},request:{...a.request}})}async function p(e,n,r,a){let s=d(e,n);await s.startEmptyTurn(r,a)}";
+  const cases = [
+    ["app://-/assets/send-follow-up-message-41b7bd38775d.js", followUp, "sendFollowUpMessage", { prompt: "hi" }],
+    ["app://-/assets/start-turn-e9a3bd89232f.js", turnStart, "startTurn", { request: { input: [] } }],
+  ];
+  for (const [url, source, method, options] of cases) {
+    const patched = globalThis.__codeyRendererPatchEntry(url, source);
+    assert.ok(patched?.includes(`"${method}",`), method);
+    assert.equal(globalThis.__codeyRendererPatchEntry(url, patched), null, `${method} patch is idempotent`);
+    const calls = [];
+    const rpc = { [method]: async (...args) => { calls.push(["native", ...args]); return "sent"; } };
+    const run = Function("d", "c", `${patched};return f`)(() => rpc, () => true);
+    delete globalThis.__codeyModelWhitelistPatch;
+    assert.equal(await run({}, "local", "thread", options), "sent", `${method} works without the gate`);
+    globalThis.__codeyModelWhitelistPatch = { hostedTurnCall: async (target, name, threadId, value) => {
+      calls.push(["gate", name, threadId]);
+      return target[name](threadId, value);
+    } };
+    try {
+      assert.equal(await run({}, "local", "thread", options), "sent");
+    } finally {
+      delete globalThis.__codeyModelWhitelistPatch;
+    }
+    assert.deepEqual(calls.map(([kind, name]) => kind === "gate" ? `gate:${name}` : kind), ["native", `gate:${method}`, "native"]);
+  }
+  const lock = "function t(e){return!r.has(e)&&(r.add(e),!0)}";
+  assert.equal(globalThis.__codeyRendererPatchEntry("app://-/assets/start-turn-lock-be4319076981.js", lock), null);
 });

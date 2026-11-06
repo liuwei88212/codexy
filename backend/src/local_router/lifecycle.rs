@@ -179,8 +179,7 @@ fn official_account_email(route: &RouteTarget) -> Option<&str> {
 struct SignaledRequestBody {
     bytes: Bytes,
     cursor: usize,
-    /// 结束帧交出之后才为真。最后一块数据交出时不能提前变成结束，否则连接
-    /// 不会先把写缓冲刷进套接字，响应头期限会把还在缓冲里的历史上传算进去。
+    /// 已交出结束帧；按 Content-Length 结束的实现可能跳过该帧，由 Drop 补发完成信号。
     ended: bool,
     uploaded: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -199,6 +198,17 @@ impl SignaledRequestBody {
             self.bytes.len()
         } else {
             end
+        }
+    }
+}
+
+impl Drop for SignaledRequestBody {
+    fn drop(&mut self) {
+        // Content-Length 已满足时 Hyper 可以直接丢弃正文，不再轮询结束帧。
+        if self.cursor == self.bytes.len() {
+            if let Some(uploaded) = self.uploaded.take() {
+                let _ = uploaded.send(());
+            }
         }
     }
 }
@@ -407,7 +417,7 @@ where
         let transport = attempts.transport;
         let trigger = match attempts.retry_reason() {
             Some(RetryReason::Plugin) => crate::route_request_log::AttemptTrigger::PluginRetry,
-            Some(RetryReason::ReasoningText) => {
+            Some(RetryReason::ReasoningText | RetryReason::EncryptedReasoning) => {
                 crate::route_request_log::AttemptTrigger::ReasoningRepair
             }
             None => crate::route_request_log::AttemptTrigger::Initial,
@@ -617,6 +627,12 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
     fn set_streaming_errors(&mut self, enabled: bool) {
         self.inner.set_streaming_errors(enabled);
     }
+    fn set_compaction_disconnect_monitor(&mut self, enabled: bool) {
+        self.inner.set_compaction_disconnect_monitor(enabled);
+    }
+    fn compaction_disconnect_monitor(&self) -> bool {
+        self.inner.compaction_disconnect_monitor()
+    }
     fn request_log_probe(&self) -> Option<&RouteRequestLogProbe> {
         self.inner.request_log_probe()
     }
@@ -678,6 +694,9 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
     }
     async fn finish_event_stream(&mut self) -> Result<()> {
         self.inner.finish_event_stream().await
+    }
+    async fn finish_delivered_compaction_stream(&mut self) {
+        self.inner.finish_delivered_compaction_stream().await;
     }
     async fn proxy_response_with_probe(
         &mut self,
@@ -794,6 +813,39 @@ mod tests {
         ));
         assert!(HttpBody::is_end_stream(&body));
         uploaded.try_recv().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_length_body_drop_signals_only_a_fully_consumed_upload() {
+        for consume in [false, true] {
+            let (mut body, mut uploaded) = signaled_request_body(Bytes::from_static(b"hello"));
+            if consume {
+                let waker = futures_util::task::noop_waker();
+                let mut context = std::task::Context::from_waker(&waker);
+                assert!(matches!(
+                    Pin::new(&mut body).poll_frame(&mut context),
+                    Poll::Ready(Some(Ok(_)))
+                ));
+                assert!(uploaded.try_recv().is_err());
+            }
+            drop(body);
+            assert_eq!(uploaded.await.is_ok(), consume);
+        }
+        let (mut body, uploaded) = signaled_request_body(Bytes::from(vec![
+            0;
+            HYPER_H1_WRITE_BUFFER_BYTES * 2 + 10
+        ]));
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut context),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        drop(body);
+        assert!(
+            uploaded.await.is_err(),
+            "partial uploads must not signal success"
+        );
     }
 
     #[test]

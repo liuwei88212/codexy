@@ -1525,7 +1525,7 @@ export function App({
                 <Button
                   aria-label="打开 Codey GitHub 仓库"
                   className="sidebar-footer-icon-btn"
-                  onClick={() => window.open("https://github.com/SuperGness/codey", "_blank", "noopener,noreferrer")}
+                  onClick={() => window.open("https://github.com/liuwei88212/codexy", "_blank", "noopener,noreferrer")}
                   size="icon-sm"
                   variant="ghost"
                 >

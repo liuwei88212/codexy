@@ -1990,7 +1990,7 @@ fn user_update_manifest_url_is_ignored_and_not_persisted() {
 
 #[test]
 fn update_manifest_url_defaults_to_the_public_source_for_local_builds() {
-    let expected = format!("{DEFAULT_UPDATE_BASE_URL}/latest.json");
+    let expected = GITHUB_RELEASES_URL.to_string();
 
     assert_eq!(update_manifest_url_from_base(None), expected);
     assert_eq!(update_manifest_url_from_base(Some("  ")), expected);

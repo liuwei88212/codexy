@@ -23,6 +23,10 @@
   const runtimeHealthCheckTimeoutMs = 3_000;
   const runtimeHealthFailureRetryMs = 1_000;
   const runtimeHealthFailureThreshold = 2;
+  // 判定中断后加密复查，看门狗修好桥接后红色状态能尽快解除。
+  const runtimeHealthUnavailableRetryMs = 5_000;
+  // 超时回调比预算晚到这么久，说明是页面主线程自己卡住，无法据此判断后端。
+  const runtimeHealthStallToleranceMs = 1_500;
   // 系统睡眠会同时冻结页面和后端，唤醒瞬间所有进程一起恢复，
   // 3 秒的往返预算不足以判断 Codey 是否真的退出。排程间隔远超定时器
   // 周期即视为刚从睡眠恢复，在这段宽限期内放宽超时与失败阈值。
@@ -57,13 +61,14 @@
   let codeyUpdatePolicy = null;
   let updateCheckGeneration = 0;
   let runtimeHealthTimer = 0;
-  let runtimeHealthCheckInFlight = false;
+  let runtimeHealthCheckPromise = null;
   let runtimeHealthFailures = 0;
   let runtimeHealthState = "checking";
   let runtimeHealthMessage = "";
   let runtimeHealthObservedAt = 0;
   let runtimeHealthLastCheckAt = 0;
   let runtimeHealthResumeGraceUntil = 0;
+  let settingsOpenPending = false;
   let accountUsageTimer = 0;
   let accountUsageCheckInFlight = false;
   let accountUsagePollingEnabled = true;
@@ -127,46 +132,54 @@
       #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
       #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
       #${buttonId}[data-codey-runtime-state="unavailable"][data-codey-update-available="true"]::after { top: auto; right: 3px; bottom: 3px; width: 5px; height: 5px; }
-      /* 跟随宿主 color-scheme；明确的主题类优先于系统偏好。浮层保持不透明。 */
-      #${accountUsageId} { --codey-usage-surface: light-dark(#ffffff, #252525); --codey-usage-ink: light-dark(#202124, #f3f3f3); --codey-usage-muted: light-dark(#65686d, #b1b1b5); --codey-usage-line: light-dark(#e7e8ea, #3d3d40); --codey-usage-track: light-dark(#e9ebed, #3c3d40); -webkit-app-region: no-drag !important; position: relative; display: block; box-sizing: border-box; width: 100%; min-width: 0; padding: 9px 16px 10px; background: transparent; color: var(--codey-usage-ink); container-type: inline-size; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; line-height: 1.4; pointer-events: auto !important; user-select: none; }
+      /* 跟随宿主 color-scheme；明确的主题类优先于系统偏好。iOS 液态玻璃质感。 */
+      #${accountUsageId} { --codey-usage-ink: light-dark(#1d1d1f, #f5f5f7); --codey-usage-muted: light-dark(#86868b, #98989d); --codey-usage-line: light-dark(rgba(60, 60, 67, .09), rgba(235, 235, 245, .09)); --codey-usage-track: light-dark(rgba(0, 0, 0, .05), rgba(255, 255, 255, .08)); -webkit-app-region: no-drag !important; position: relative; display: block; box-sizing: border-box; width: 100%; min-width: 0; padding: 9px 16px 10px; border: 0; border-radius: 12px; background: light-dark(#ffffff, #222226); box-shadow: 0 1px 5px -1px light-dark(rgba(0, 0, 0, .08), rgba(0, 0, 0, .4)); color: var(--codey-usage-ink); container-type: inline-size; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang SC", "Helvetica Neue", sans-serif; line-height: 1.4; pointer-events: auto !important; user-select: none; transition: box-shadow .18s ease; }
       :where(.light, [data-theme="light"]) #${accountUsageId} { color-scheme: light; }
       :where(.dark, [data-theme="dark"]) #${accountUsageId} { color-scheme: dark; }
+      #${accountUsageId}:hover { box-shadow: 0 3px 14px -3px light-dark(rgba(0, 0, 0, .12), rgba(0, 0, 0, .5)); }
       #${accountUsageId}[data-state="stale"] .codey-usage-details-updated::before { content: "上次成功数据 · "; }
       #${accountUsageId}[data-state="error"] { padding-block: 8px; color: color-mix(in srgb, CanvasText 58%, transparent); font-size: 10px; }
       #${accountUsageId} .codey-usage-list { display: grid; min-width: 0; grid-template-columns: repeat(var(--codey-usage-window-count), minmax(0, 1fr)); gap: 12px; }
-      #${accountUsageId} .codey-usage-segment, #${accountUsageId} .codey-usage-detail-row { --codey-usage-accent: light-dark(#00865c, #34d399); --codey-usage-accent-bg: light-dark(#e2f5ed, #183e32); min-width: 0; }
+      #${accountUsageId} .codey-usage-segment, #${accountUsageId} .codey-usage-detail-row { --codey-usage-accent: light-dark(#248a3d, #30d158); --codey-usage-accent-bg: light-dark(rgba(52, 199, 89, .14), rgba(48, 209, 88, .22)); min-width: 0; }
       #${accountUsageId}[data-window-count="2"] .codey-usage-segment + .codey-usage-segment { border-inline-start: 1px solid color-mix(in srgb, CanvasText 9%, transparent); padding-inline-start: 12px; }
       #${accountUsageId} .codey-usage-overview { display: flex; min-width: 0; align-items: center; gap: 6px; }
       #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; color: var(--codey-usage-muted); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-plan-tag { flex: 0 0 auto; overflow: hidden; max-width: 44%; border: 1px solid color-mix(in srgb, #0a84ff 32%, transparent); border-radius: 999px; padding: 1px 6px; background: color-mix(in srgb, #0a84ff 13%, transparent); color: light-dark(#0068cc, #69b1ff); font-size: 9px; font-weight: 600; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-plan-tag { flex: 0 0 auto; overflow: hidden; max-width: 44%; border: 1px solid color-mix(in srgb, #0a84ff 32%, transparent); border-radius: 999px; padding: 1px 6px; background: color-mix(in srgb, #0a84ff 13%, transparent); color: light-dark(#0068cc, #69b1ff); font-size: 9px; font-weight: 600; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; box-shadow: inset 0 1px 0.5px light-dark(rgba(255, 255, 255, .6), rgba(255, 255, 255, .2)); }
       #${accountUsageId} .codey-usage-plan-tag[data-plan="plus"] { border-color: light-dark(#a4d4c8, #37695e); background: light-dark(#e6f5f1, #193d37); color: light-dark(#0f766e, #91d6c1); }
-      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="100"] { border-color: light-dark(#cbd5e1, #64748b); background: linear-gradient(135deg, light-dark(#f8fafc, #394452), light-dark(#e2e8f0, #262e39)); color: light-dark(#475569, #dbe4ef); box-shadow: inset 0 1px 0 rgb(255 255 255 / .18); }
-      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="200"] { border-color: light-dark(#d6b86b, #8f7035); background: linear-gradient(135deg, light-dark(#fff8e7, #4b3b1f), light-dark(#f2dfb0, #302719)); color: light-dark(#78530e, #f2d58d); box-shadow: inset 0 1px 0 rgb(255 255 255 / .24); }
-      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="500"] { border-color: light-dark(#b89654, #c6a663); background: linear-gradient(135deg, light-dark(#49305f, #59406e), light-dark(#25182f, #302039)); color: light-dark(#f8e5af, #ffe9b0); box-shadow: inset 0 1px 0 rgb(255 234 184 / .24), 0 1px 3px rgb(37 28 54 / .15); }
-      #${accountUsageId} .codey-usage-value { flex: 0 0 auto; margin-inline-start: auto; padding: 1px 6px; border-radius: 999px; background: var(--codey-usage-accent-bg); color: var(--codey-usage-accent); font-size: 10px; font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-meter { display: block; box-sizing: border-box; width: 100%; height: 3px; min-height: 3px; max-height: 3px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: var(--codey-usage-track); contain: size; line-height: 0; }
-      #${accountUsageId} .codey-usage-meter > span { display: block; box-sizing: border-box; width: 100%; height: 100%; border-radius: inherit; background: var(--codey-usage-accent); transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
-      #${accountUsageId} .codey-usage-reset { display: block; overflow: hidden; margin-top: 5px; color: var(--codey-usage-muted); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
-      #${accountUsageId} [data-tone="normal"] { --codey-usage-accent: light-dark(#0070d9, #69b1ff); --codey-usage-accent-bg: light-dark(#e6f1ff, #20364d); }
-      #${accountUsageId} [data-tone="warning"] { --codey-usage-accent: light-dark(#ad5a00, #ffb454); --codey-usage-accent-bg: light-dark(#fff0dc, #49331c); }
-      #${accountUsageId} [data-tone="critical"] { --codey-usage-accent: light-dark(#c92a2a, #ff827a); --codey-usage-accent-bg: light-dark(#ffebea, #4a2928); }
-      #${accountUsageId} .codey-usage-details { position: absolute; z-index: 2; right: 10px; bottom: calc(100% + 4px); left: 10px; box-sizing: border-box; min-width: 0; padding: 13px; border: 1px solid var(--codey-usage-line); border-radius: 12px; background: var(--codey-usage-surface); box-shadow: 0 8px 28px light-dark(rgb(28 35 45 / .14), rgb(0 0 0 / .34)); color: var(--codey-usage-ink); opacity: 0; pointer-events: none; transform: translateY(4px); transition: opacity .14s ease, transform .14s ease, visibility .14s ease; visibility: hidden; }
-      #${accountUsageId}:hover .codey-usage-details, #${accountUsageId}:focus-visible .codey-usage-details { opacity: 1; transform: translateY(0); visibility: visible; pointer-events: auto; }
-      #${accountUsageId} .codey-usage-details::after { content: ""; position: absolute; inset: 100% 0 auto; height: 5px; }
-      #${accountUsageId}:focus-visible { border-radius: 6px; outline: 2px solid color-mix(in srgb, #0a84ff 72%, transparent); outline-offset: -2px; }
-      #${accountUsageId} .codey-usage-details-heading { display: flex; min-width: 0; align-items: center; gap: 8px; padding-bottom: 11px; }
-      #${accountUsageId} .codey-usage-details-title { font-size: 11px; font-weight: 650; }
-      #${accountUsageId} .codey-usage-details-list { display: grid; min-width: 0; gap: 12px; }
-      #${accountUsageId} .codey-usage-detail-row { padding-block-start: 11px; border-block-start: 1px solid var(--codey-usage-line); }
-      #${accountUsageId} .codey-usage-detail-main, #${accountUsageId} .codey-usage-detail-meta { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
-      #${accountUsageId} .codey-usage-detail-label { overflow: hidden; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="100"] { border-color: light-dark(#cbd5e1, #64748b); background: linear-gradient(135deg, light-dark(#f8fafc, #394452), light-dark(#e2e8f0, #262e39)); color: light-dark(#475569, #dbe4ef); box-shadow: inset 0 1px 0.5px rgb(255 255 255 / .35), 0 1px 2px rgb(0 0 0 / .06); }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="200"] { border-color: light-dark(#d6b86b, #8f7035); background: linear-gradient(135deg, light-dark(#fff8e7, #4b3b1f), light-dark(#f2dfb0, #302719)); color: light-dark(#78530e, #f2d58d); box-shadow: inset 0 1px 0.5px rgb(255 255 255 / .4), 0 1px 2px rgb(0 0 0 / .08); }
+      #${accountUsageId} .codey-usage-plan-tag[data-pro-tier="500"] { border-color: light-dark(#b89654, #c6a663); background: linear-gradient(135deg, light-dark(#49305f, #59406e), light-dark(#25182f, #302039)); color: light-dark(#f8e5af, #ffe9b0); box-shadow: inset 0 1px 0.5px rgb(255 234 184 / .4), 0 1px 3px rgb(37 28 54 / .2); }
+      #${accountUsageId} .codey-usage-value { flex: 0 0 auto; margin-inline-start: auto; padding: 1.5px 7px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--codey-usage-accent) 25%, transparent); background: linear-gradient(180deg, light-dark(rgba(255, 255, 255, .35), rgba(255, 255, 255, .12)) 0%, transparent 100%), var(--codey-usage-accent-bg); color: var(--codey-usage-accent); font-size: 10px; font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; box-shadow: inset 0 1px 0.5px light-dark(rgba(255, 255, 255, .6), rgba(255, 255, 255, .2)); }
+      #${accountUsageId} .codey-usage-meter { display: block; box-sizing: border-box; width: 100%; height: 3px; min-height: 3px; max-height: 3px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: var(--codey-usage-track); contain: size; line-height: 0; box-shadow: inset 0 0.5px 1px light-dark(rgba(0, 0, 0, .08), rgba(0, 0, 0, .25)); }
+      #${accountUsageId} .codey-usage-meter > span { display: block; box-sizing: border-box; width: 100%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, color-mix(in srgb, var(--codey-usage-accent) 80%, white 20%), var(--codey-usage-accent)); box-shadow: 0 0 6px color-mix(in srgb, var(--codey-usage-accent) 45%, transparent), inset 0 0.5px 0 rgba(255, 255, 255, .4); transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; transition: transform .25s ease-out; }
+      #${accountUsageId} .codey-usage-reset { display: block; overflow: hidden; margin-top: 5px; color: color-mix(in srgb, var(--codey-usage-ink) 70%, transparent); font-size: 10.5px; font-variant-numeric: tabular-nums; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} [data-tone="normal"] { --codey-usage-accent: light-dark(#0071e3, #0a84ff); --codey-usage-accent-bg: light-dark(rgba(0, 113, 227, .12), rgba(10, 132, 255, .20)); }
+      #${accountUsageId} [data-tone="warning"] { --codey-usage-accent: light-dark(#c96400, #ff9f0a); --codey-usage-accent-bg: light-dark(rgba(201, 100, 0, .14), rgba(255, 159, 10, .20)); }
+      #${accountUsageId} [data-tone="critical"] { --codey-usage-accent: light-dark(#d70015, #ff453a); --codey-usage-accent-bg: light-dark(rgba(215, 0, 21, .14), rgba(255, 69, 58, .22)); }
+      #${accountUsageId} .codey-usage-details { position: absolute; z-index: 2; right: 8px; bottom: calc(100% + 7px); left: 8px; box-sizing: border-box; min-width: 0; padding: 14px 15px 15px; border: 0; border-radius: 14px; background: light-dark(#ffffff, #222226); box-shadow: 0 18px 44px -10px light-dark(rgba(20, 40, 70, .2), rgba(0, 0, 0, .6)), 0 4px 14px -4px light-dark(rgba(20, 40, 70, .1), rgba(0, 0, 0, .4)); color: var(--codey-usage-ink); opacity: 0; pointer-events: none; transform: translateY(6px) scale(.97); transition: opacity .2s cubic-bezier(.16, 1, .3, 1), transform .2s cubic-bezier(.16, 1, .3, 1), visibility .2s cubic-bezier(.16, 1, .3, 1); visibility: hidden; }
+      #${accountUsageId}:hover .codey-usage-details, #${accountUsageId}:focus-visible .codey-usage-details { opacity: 1; transform: translateY(0) scale(1); visibility: visible; pointer-events: auto; }
+      #${accountUsageId} .codey-usage-details::after { content: ""; position: absolute; inset: 100% 0 auto; height: 9px; }
+      #${accountUsageId}:focus-visible { outline: 2px solid color-mix(in srgb, #0a84ff 72%, transparent); outline-offset: -2px; }
+      #${accountUsageId} .codey-usage-details-heading { position: relative; z-index: 1; display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 11px; }
+      #${accountUsageId} .codey-usage-details-title { font-size: 12px; font-weight: 650; letter-spacing: -.01em; }
+      #${accountUsageId} .codey-usage-details-updated { margin-inline-start: auto; color: var(--codey-usage-muted); font-size: 9.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-details-list { position: relative; z-index: 1; display: grid; min-width: 0; gap: 12px; }
+      #${accountUsageId} .codey-usage-detail-row { position: relative; padding-block-start: 11px; border-block-start: 1px solid var(--codey-usage-line); }
+      #${accountUsageId} .codey-usage-detail-main, #${accountUsageId} .codey-usage-detail-meta { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+      #${accountUsageId} .codey-usage-detail-label { overflow: hidden; font-size: 11.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
       #${accountUsageId} .codey-usage-detail-value { margin-inline-start: auto; font-size: 13px; font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-detail-row[data-tone] .codey-usage-detail-value { padding: 1px 7px; border-radius: 999px; background: var(--codey-usage-accent-bg); color: var(--codey-usage-accent); font-size: 10px; }
-      #${accountUsageId} .codey-usage-detail-row .codey-usage-meter { height: 5px; min-height: 5px; max-height: 5px; margin-top: 8px; }
-      #${accountUsageId} .codey-usage-detail-meta { flex-wrap: wrap; margin-top: 6px; gap: 3px 8px; color: var(--codey-usage-muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+      #${accountUsageId} .codey-usage-detail-row[data-tone] .codey-usage-detail-value { padding: 1.5px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--codey-usage-accent) 30%, transparent); background: linear-gradient(180deg, light-dark(rgba(255, 255, 255, .35), rgba(255, 255, 255, .12)) 0%, transparent 100%), var(--codey-usage-accent-bg); color: var(--codey-usage-accent); font-size: 10.5px; font-weight: 650; box-shadow: inset 0 1px 0.5px light-dark(rgba(255, 255, 255, .7), rgba(255, 255, 255, .25)), 0 1px 3px light-dark(rgba(0, 0, 0, .05), rgba(0, 0, 0, .2)); }
+      #${accountUsageId} .codey-usage-detail-row .codey-usage-meter { height: 5px; min-height: 5px; max-height: 5px; border-radius: 999px; background: var(--codey-usage-track); box-shadow: inset 0 1px 2px light-dark(rgba(0, 0, 0, .08), rgba(0, 0, 0, .3)); }
+      #${accountUsageId} .codey-usage-detail-reset { flex: 0 1 auto; margin-inline-start: auto; overflow: hidden; color: color-mix(in srgb, var(--codey-usage-ink) 78%, transparent); font-size: 11px; font-variant-numeric: tabular-nums; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-detail-gauge { display: flex; min-width: 0; align-items: center; gap: 9px; margin-top: 8px; }
+      #${accountUsageId} .codey-usage-detail-gauge .codey-usage-meter { flex: 1 1 auto; margin-top: 0; }
+      #${accountUsageId} .codey-usage-detail-percent { flex: 0 0 auto; color: var(--codey-usage-accent); font-size: 16px; font-variant-numeric: tabular-nums; font-weight: 700; line-height: 1.1; text-shadow: 0 0 12px color-mix(in srgb, var(--codey-usage-accent) 35%, transparent); white-space: nowrap; }
+      #${accountUsageId} .codey-usage-detail-meta { flex-wrap: wrap; margin-top: 6px; gap: 3px 8px; color: color-mix(in srgb, var(--codey-usage-ink) 66%, transparent); font-size: 10.5px; font-variant-numeric: tabular-nums; line-height: 1.35; }
       #${accountUsageId} .codey-usage-detail-meta span { white-space: nowrap; }
       #${accountUsageId} .codey-usage-detail-meta span + span { margin-inline-start: auto; }
-      #${accountUsageId} .codey-usage-details-updated { margin-top: 11px; padding-top: 9px; border-top: 1px solid var(--codey-usage-line); color: var(--codey-usage-muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+      #${accountUsageId} .codey-usage-detail-meta .is-expiring { color: var(--codey-usage-accent); font-weight: 600; }
+      #${accountUsageId} .codey-usage-credit-dot { flex: 0 0 auto; width: 6px; height: 6px; margin-inline-start: -2px; border-radius: 999px; background: currentColor; color: light-dark(#d70015, #ff453a); animation: codey-usage-breathe 1.6s ease-in-out infinite; }
+      @keyframes codey-usage-breathe { 0%, 100% { opacity: .3; transform: scale(.72); box-shadow: 0 0 0 0 rgba(255, 59, 48, .5); } 50% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 5px rgba(255, 59, 48, .06); } }
       #${accountUsageId}[data-window-count="2"] .codey-usage-list:has(.codey-usage-plan-tag) { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); }
       @container (max-width: 280px) {
         #${accountUsageId} .codey-usage-list { gap: 8px; }
@@ -177,7 +190,12 @@
       }
       @media (prefers-reduced-motion: reduce) {
         #${buttonId}, #${buttonId} *, #${accountUsageId}, #${accountUsageId} * { animation: none !important; transition: none !important; }
+        /* 预警灯保留仅透明度的慢速呼吸，不带位移和光环。 */
+        #${accountUsageId} .codey-usage-credit-dot { animation: codey-usage-breathe 3.2s ease-in-out infinite !important; transform: none !important; box-shadow: none !important; }
       }
+      /* 已有 Codey 额度信息，隐藏原生图标栏内重复的用量入口。 */
+      ${navigationRailSelector} button[aria-label="用量"][aria-description],
+      ${navigationRailSelector} button[aria-label="Usage" i][aria-description] { display: none !important; }
     `;
     document.documentElement.appendChild(style);
   };
@@ -300,8 +318,15 @@
       scheduleRuntimeHealthCheck();
       return runtimeHealthSnapshot();
     }
-    if (runtimeHealthCheckInFlight) return runtimeHealthSnapshot();
-    runtimeHealthCheckInFlight = true;
+    // 并发调用共用同一次检查：点击入口要等到这次的结论，不能拿旧快照。
+    runtimeHealthCheckPromise ||= runRuntimeHealthCheck().finally(() => {
+      runtimeHealthCheckPromise = null;
+    });
+    return runtimeHealthCheckPromise;
+  };
+
+  const runRuntimeHealthCheck = async () => {
+    let inconclusive = false;
     const observedAt = Date.now();
     const observedGap = runtimeHealthLastCheckAt > 0
       ? observedAt - runtimeHealthLastCheckAt
@@ -338,19 +363,26 @@
       error.code = result?.code || "backend_unavailable";
       throw error;
     } catch (error) {
-      runtimeHealthFailures += 1;
       const immediate = error?.code === "bridge_unavailable";
+      // 看门狗重建桥接时，上一代未完成的调用以 bridge_reinstalled 结束，
+      // 说明后端正在恢复；页面卡顿时超时同样不反映后端状态。两者都不计失败。
+      inconclusive = !immediate && (
+        error?.code === "bridge_reinstalled"
+        || Date.now() - observedAt > checkTimeoutMs + runtimeHealthStallToleranceMs
+      );
+      if (inconclusive) return runtimeHealthSnapshot();
+      runtimeHealthFailures += 1;
       if (immediate) runtimeHealthFailures = failureThreshold;
       if (runtimeHealthFailures >= failureThreshold) {
         return setRuntimeHealthState("unavailable", "Codey 后端未响应");
       }
       return setRuntimeHealthState("checking", "正在确认 Codey 进程状态");
     } finally {
-      runtimeHealthCheckInFlight = false;
-      const nextDelay = runtimeHealthFailures > 0
-        && runtimeHealthFailures < failureThreshold
-        ? runtimeHealthFailureRetryMs
-        : runtimeHealthCheckIntervalMs;
+      let nextDelay = runtimeHealthCheckIntervalMs;
+      if (runtimeHealthState === "unavailable") nextDelay = runtimeHealthUnavailableRetryMs;
+      if (inconclusive || (runtimeHealthFailures > 0 && runtimeHealthFailures < failureThreshold)) {
+        nextDelay = runtimeHealthFailureRetryMs;
+      }
       scheduleRuntimeHealthCheck(nextDelay);
     }
   };
@@ -484,13 +516,41 @@
       .map((bucket) => bucket.planType)
       .find((value) => typeof value === "string" && value.trim())
       || (typeof payload.planType === "string" ? payload.planType : undefined);
+    const resetCredits = normalizeResetCreditsSummary(
+      payload.rateLimitResetCredits ?? payload.rate_limit_reset_credits
+        ?? payload.rateLimits?.rateLimitResetCredits ?? payload.rateLimits?.rate_limit_reset_credits,
+    );
     return {
       status: "ok",
       ...(planType ? { planType } : {}),
       ...(primary ? { primary } : {}),
       ...(secondary ? { secondary } : {}),
       ...(credits ? { credits } : {}),
+      ...(resetCredits ? { resetCredits } : {}),
       fetchedAt: Math.floor(Date.now() / 1000),
+    };
+  };
+
+  // AppServer 的 rateLimitResetCredits 带剩余次数与明细行；明细行取最近一次
+  // 过期时间，明细缺失时只保留次数。
+  const normalizeResetCreditsSummary = (summary) => {
+    if (!summary || typeof summary !== "object") return null;
+    const count = Number(summary.availableCount ?? summary.available_count);
+    if (!Number.isFinite(count)) return null;
+    let nextExpiresAt;
+    const rows = Array.isArray(summary.credits) ? summary.credits : [];
+    for (const row of rows) {
+      const status = String(row?.status || "");
+      if (status === "redeemed" || status === "unknown") continue;
+      const raw = Number(row?.expiresAt ?? row?.expires_at);
+      if (!Number.isFinite(raw) || raw <= 0) continue;
+      const expires = Math.round(raw > 10_000_000_000 ? raw / 1000 : raw);
+      if (expires * 1000 <= Date.now()) continue;
+      nextExpiresAt = nextExpiresAt === undefined ? expires : Math.min(nextExpiresAt, expires);
+    }
+    return {
+      availableCount: Math.max(0, Math.round(count)),
+      ...(nextExpiresAt ? { nextExpiresAt } : {}),
     };
   };
 
@@ -547,7 +607,7 @@
     return hours ? `${days} 天 ${hours} 小时后重置` : `${days} 天后重置`;
   };
 
-  const accountUsageResetTimeLabel = (resetsAt) => {
+  const accountUsageDayTimeLabel = (resetsAt) => {
     const timestamp = Number(resetsAt);
     if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
     const resetAt = new Date(timestamp * 1000);
@@ -571,9 +631,14 @@
       minute: "2-digit",
       hour12: false,
     });
-    if (dayOffset === 0) return `今天 ${time} 重置`;
-    if (dayOffset === 1) return `明天 ${time} 重置`;
-    return `${resetAt.getMonth() + 1}月${resetAt.getDate()}日 ${time} 重置`;
+    if (dayOffset === 0) return `今天 ${time}`;
+    if (dayOffset === 1) return `明天 ${time}`;
+    return `${resetAt.getMonth() + 1}月${resetAt.getDate()}日 ${time}`;
+  };
+
+  const accountUsageResetTimeLabel = (resetsAt) => {
+    const label = accountUsageDayTimeLabel(resetsAt);
+    return label ? `${label} 重置` : "";
   };
 
   // Codex 把侧边栏底部内容收进贴底的绝对定位 footer 容器后，容器内容由 Codex
@@ -625,7 +690,7 @@
     ? "critical"
     : remaining <= 40 ? "warning" : remaining <= 70 ? "normal" : "healthy";
 
-  const accountUsageWindowSegment = (window, kind, plan = "") => {
+  const accountUsageWindowSegment = (window, kind, plan = "", creditDot = false) => {
     if (!window || accountUsageWindowKind(window) !== kind) return null;
     const proTier = /^Pro (100|200|500)$/.exec(plan)?.[1];
     const remaining = Math.max(0, Math.min(100, 100 - Number(window.usedPercent)));
@@ -640,6 +705,7 @@
       html: `
         <span class="codey-usage-segment" data-window="${kind}" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
           <span class="codey-usage-overview">
+            ${creditDot ? `<span class="codey-usage-credit-dot" aria-hidden="true"></span>` : ""}
             ${plan ? `<span class="codey-usage-plan-tag"${plan === "Plus" ? ' data-plan="plus"' : ""}${proTier ? ` data-pro-tier="${proTier}"` : ""}>${escapeAccountUsageText(plan)}</span>` : ""}
             <span class="codey-usage-window-label">${label}</span>
             <span class="codey-usage-value">${roundedRemaining}%</span>
@@ -651,7 +717,7 @@
     };
   };
 
-  const accountUsageSegments = (result) => {
+  const accountUsageSegments = (result, creditExpiring = false) => {
     const windowsByKind = new Map();
     for (const window of [result?.primary, result?.secondary]) {
       const kind = accountUsageWindowKind(window);
@@ -664,6 +730,7 @@
       windowsByKind.get(kind),
       kind,
       index === 0 ? plan : "",
+      index === 0 && creditExpiring,
     ));
   };
 
@@ -676,12 +743,11 @@
       <div class="codey-usage-detail-row" data-tone="${accountUsageTone(Math.round(remaining))}" style="--codey-usage-remaining:${remaining / 100}">
         <div class="codey-usage-detail-main">
           <span class="codey-usage-detail-label">${escapeAccountUsageText(accountUsageWindowLabel(window))}</span>
-          <span class="codey-usage-detail-value">剩余 ${Math.round(remaining)}%</span>
+          ${reset ? `<span class="codey-usage-detail-reset">${escapeAccountUsageText(reset)}</span>` : ""}
         </div>
-        <span class="codey-usage-meter" aria-hidden="true"><span></span></span>
-        <div class="codey-usage-detail-meta">
-          <span>已用 ${Math.round(used)}%</span>
-          ${reset ? `<span>${escapeAccountUsageText(reset)}</span>` : ""}
+        <div class="codey-usage-detail-gauge">
+          <span class="codey-usage-meter" aria-hidden="true"><span></span></span>
+          <span class="codey-usage-detail-percent">${Math.round(remaining)}%</span>
         </div>
       </div>
     `;
@@ -689,19 +755,49 @@
 
   const accountUsageCreditsDetail = (credits) => {
     if (!credits) return "";
+    const numeric = Number(credits.balance);
+    const explicitBalance = credits.balance !== undefined && credits.balance !== null
+      && credits.balance !== "" && Number.isFinite(numeric);
+    // 余额为零时不占行：显式 0 直接隐藏；无余额字段时按 hasCredits 兜底。
+    if (!credits.unlimited && explicitBalance && numeric <= 0) return "";
+    if (!credits.unlimited && !explicitBalance && !credits.hasCredits) return "";
     const balance = credits.unlimited
       ? "不限"
-      : credits.balance !== undefined && credits.balance !== null
+      : explicitBalance
         ? String(credits.balance).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "")
-        : credits.hasCredits
-          ? "可用"
-          : "0";
+        : "可用";
     return `
       <div class="codey-usage-detail-row">
         <div class="codey-usage-detail-main">
           <span class="codey-usage-detail-label">Credits 余额</span>
           <span class="codey-usage-detail-value">${escapeAccountUsageText(balance)}</span>
         </div>
+      </div>
+    `;
+  };
+
+  // 充值卡在最近一次过期 12 小时内进入预警：详情行转红色并加呼吸灯，
+  // 侧栏摘要也亮一颗红点。
+  const accountUsageResetExpiring = (resetCredits) => {
+    if (!(Number(resetCredits?.availableCount) > 0)) return false;
+    const expiresAt = Number(resetCredits?.nextExpiresAt) * 1000;
+    const now = Date.now();
+    return Number.isFinite(expiresAt) && expiresAt > now && expiresAt - now <= 12 * 60 * 60 * 1000;
+  };
+
+  const accountUsageResetCreditsDetail = (resetCredits) => {
+    const count = Number(resetCredits?.availableCount);
+    if (!Number.isFinite(count) || count <= 0) return "";
+    const expiry = accountUsageDayTimeLabel(resetCredits.nextExpiresAt);
+    const expiring = accountUsageResetExpiring(resetCredits);
+    return `
+      <div class="codey-usage-detail-row"${expiring ? ' data-tone="critical"' : ""}>
+        <div class="codey-usage-detail-main">
+          <span class="codey-usage-detail-label">剩余重置次数</span>
+          ${expiring ? `<span class="codey-usage-credit-dot" aria-hidden="true"></span>` : ""}
+          <span class="codey-usage-detail-value">${Math.max(0, Math.round(count))} 次</span>
+        </div>
+        ${expiry ? `<div class="codey-usage-detail-meta"><span${expiring ? ' class="is-expiring"' : ""}>最近 ${escapeAccountUsageText(expiry)} 过期</span></div>` : ""}
       </div>
     `;
   };
@@ -723,6 +819,7 @@
       accountUsageDetailWindow(result?.primary),
       accountUsageDetailWindow(result?.secondary),
       accountUsageCreditsDetail(result?.credits),
+      accountUsageResetCreditsDetail(result?.resetCredits),
     ].filter(Boolean);
     const fetched = accountUsageFetchedLabel(result?.fetchedAt);
     if (!rows.length && !fetched) return "";
@@ -730,9 +827,9 @@
       <div id="codey-account-usage-details" class="codey-usage-details" role="tooltip">
         <div class="codey-usage-details-heading">
           <span class="codey-usage-details-title">额度详情</span>
+          ${fetched ? `<span class="codey-usage-details-updated">${escapeAccountUsageText(fetched)}</span>` : ""}
         </div>
         <div class="codey-usage-details-list">${rows.join("")}</div>
-        ${fetched ? `<div class="codey-usage-details-updated">${escapeAccountUsageText(fetched)}</div>` : ""}
       </div>
     `;
   };
@@ -796,6 +893,7 @@
         return;
       }
       usage.dataset.state = "error";
+      delete usage.dataset.creditExpiring;
       usage.setAttribute("aria-label", "官方账号额度暂不可用");
       usage.title = String(result.message || "官方账号额度暂不可用");
       usage.__codeyLastUsageHtml = "";
@@ -804,7 +902,8 @@
     }
     if (result.status !== "ok") return;
 
-    const segments = accountUsageSegments(result);
+    const creditExpiring = accountUsageResetExpiring(result?.resetCredits);
+    const segments = accountUsageSegments(result, creditExpiring);
     accountUsageLastResult = result;
     if (!segments.length) {
       removeAccountUsage();
@@ -812,9 +911,12 @@
     }
     const usage = accountUsageMount();
     if (!usage) return;
-    const aria = segments.map((segment) => segment.aria).join("；");
+    const aria = segments.map((segment) => segment.aria).join("；")
+      + (creditExpiring ? "；重置次数即将过期" : "");
     usage.dataset.state = "ready";
     usage.dataset.windowCount = String(segments.length);
+    if (creditExpiring) usage.dataset.creditExpiring = "true";
+    else delete usage.dataset.creditExpiring;
     delete usage.dataset.plan;
     usage.style.setProperty("--codey-usage-window-count", String(segments.length));
     usage.setAttribute("aria-label", aria);
@@ -905,14 +1007,54 @@
     }
   };
 
-  const openSettings = () => {
+  const openSettings = async () => {
+    if (settingsOpenPending) return;
     if (runtimeHealthState === "unavailable") {
+      // 红色状态可能来自页面卡顿的误判，或桥接已恢复而下一轮检查未到；
+      // 当场复查一次，仍连不上才提示。
+      settingsOpenPending = true;
+      let health;
+      try {
+        health = await checkRuntimeHealth();
+      } finally {
+        settingsOpenPending = false;
+      }
+      if (health.state === "healthy") {
+        openSettingsOverlay();
+        return;
+      }
       window.alert(
         "Codey 与 Codex 的连接已中断，当前配置面板无法连接。"
         + "Codey 会继续尝试自动恢复；若长时间仍未恢复，请退出 Codex 后重新启动 Codey。",
       );
       return;
     }
+    openSettingsOverlay();
+  };
+
+  // 配置面板按需加载；悬停停留或按下、聚焦时提前加载，点击时直接打开。
+  // 掠过按钮不加载，失败也不提示，错误与重试留给真正的点击。
+  const settingsPreloadDelayMs = 120;
+  let settingsPreloadTimer = 0;
+  const preloadSettingsOverlay = () => {
+    window.clearTimeout(settingsPreloadTimer);
+    settingsPreloadTimer = 0;
+    const overlay = window.__codeySettingsOverlay;
+    if (runtimeHealthState === "unavailable"
+      || !overlay?.__codeyLazyLoader
+      || typeof overlay.load !== "function") return;
+    void Promise.resolve().then(() => overlay.load()).catch(() => {});
+  };
+  const scheduleSettingsPreload = () => {
+    window.clearTimeout(settingsPreloadTimer);
+    settingsPreloadTimer = window.setTimeout(preloadSettingsOverlay, settingsPreloadDelayMs);
+  };
+  const cancelSettingsPreload = () => {
+    window.clearTimeout(settingsPreloadTimer);
+    settingsPreloadTimer = 0;
+  };
+
+  const openSettingsOverlay = () => {
     if (window.__codeySettingsOverlay?.toggle) {
       window.__codeySettingsOverlay.toggle();
       return;
@@ -1105,8 +1247,12 @@
       button.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        openSettings();
+        void openSettings();
       }, true);
+      button.addEventListener("pointerenter", scheduleSettingsPreload, { passive: true });
+      button.addEventListener("pointerleave", cancelSettingsPreload, { passive: true });
+      button.addEventListener("pointerdown", preloadSettingsOverlay, { passive: true });
+      button.addEventListener("focus", preloadSettingsOverlay);
     }
     if (railMount) {
       button.dataset.codeyRailSlot = "true";
@@ -1380,6 +1526,14 @@
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
         : mutation.target?.parentElement;
+      const conversationTurn = target?.closest?.("[data-turn-key]");
+      if (
+        mutation.type === "childList"
+        && conversationTurn
+        && conversationTurn.isConnected !== false
+      ) {
+        continue;
+      }
       if (
         target?.id === accountUsageId
         || target?.closest?.(`#${accountUsageId}`)

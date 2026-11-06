@@ -155,7 +155,7 @@ test("incremental sidebar roots synchronize session tabs once per batch", () => 
   const selector = "[data-app-action-sidebar-thread-id]";
   const before = runtime.queries(selector);
   runtime.observers[0].callback(rows.map((target) => ({
-    type: "attributes", attributeName: "aria-label", target,
+    type: "attributes", attributeName: "data-app-action-sidebar-thread-title", target,
   })));
   runtime.runTimeout(60);
   assert.equal(runtime.queries(selector) - before, 1);
@@ -652,7 +652,11 @@ test("dispose cancels scan, watcher, sidebar tooltip and running recheck timers"
   spinner.remove();
   runtime.window.__codeyInstallThreadUpdatedTimes(row);
   runtime.document.dispatchEvent({ type: "pointerdown" });
-  runtime.observers[0].callback([{ type: "attributes", attributeName: "aria-label", target: row }]);
+  runtime.observers[0].callback([{
+    type: "attributes",
+    attributeName: "data-app-action-sidebar-thread-title",
+    target: row,
+  }]);
 
   const archive = new FakeElement("button", { "aria-label": "归档任务" });
   row.appendChild(archive);

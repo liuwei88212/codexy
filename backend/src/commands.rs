@@ -26,7 +26,6 @@ mod wechat_claw;
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
     build_codex_executable, normalize_codex_app_path_checked,
-    resolve_validated_codex_app_dir_with_saved_checked,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -54,6 +53,8 @@ use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
 };
+#[cfg(all(test, unix))]
+pub(crate) use runtime::cleanup_pending_runtime_start_with;
 use runtime::runtime_status_with_options;
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
@@ -78,7 +79,7 @@ use wechat_claw::{
     WechatClawLoginState, WechatClawSessionGuard, WechatClawSyncHandle,
     pause_wechat_claw_notification_channel, poll_wechat_claw_login,
     refresh_wechat_claw_channel_context, start_wechat_claw_login, stop_wechat_claw_service,
-    sync_wechat_claw_service, wechat_claw_login_http_client,
+    sync_wechat_claw_service, wechat_claw_login_http_client_builder,
     wechat_claw_notification_cooldown_remaining,
 };
 
@@ -98,8 +99,6 @@ use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
 };
 use crate::error_log;
-#[cfg(windows)]
-use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
 use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
 use crate::message_delete::delete_messages_persistently;
 use crate::model_catalog;
@@ -128,7 +127,8 @@ pub struct AppState {
     /// changes arrive on plugin threads, which cannot see that runtime via
     /// `Handle::try_current`.
     runtime_handle: Option<tokio::runtime::Handle>,
-    pub http_client: reqwest::Client,
+    /// 官方账号授权、更新检查与模型拉取共用的客户端，随系统代理变化重建。
+    pub http_client: crate::system_proxy_client::SystemProxyClient,
     /// Official token refresh clients keyed by account proxy URL.
     official_proxied_clients: BlockingMutex<HashMap<String, reqwest::Client>>,
     #[cfg(test)]
@@ -138,7 +138,8 @@ pub struct AppState {
     /// Built on first use: the login/sync client is only needed for WeChat
     /// ClawBot flows, and constructing a reqwest client loads the system root
     /// certificates, which is measurable on the startup path.
-    wechat_claw_login_http_client: std::sync::OnceLock<reqwest::Client>,
+    wechat_claw_login_http_client:
+        std::sync::OnceLock<crate::system_proxy_client::SystemProxyClient>,
     /// Official-account resolution started before the update check so the two
     /// startup waits overlap.
     official_account_probe_prewarm: Mutex<Option<OfficialAccountProbePrewarm>>,
@@ -150,6 +151,7 @@ pub struct AppState {
     official_account_refresh_lock: Mutex<()>,
     account_usage_cache: Arc<Mutex<account_usage::AccountUsageCaches>>,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
+    pub(crate) failed_runtime_start: Mutex<Option<Arc<crate::launcher::PendingRuntimeCleanup>>>,
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
     trace_log_write_protection_active: AtomicBool,
@@ -168,6 +170,9 @@ pub struct AppState {
     shutting_down: AtomicBool,
     restart_task: Mutex<Option<ScheduledRestart>>,
     runtime_generation: AtomicU64,
+    runtime_intent: watch::Sender<u64>,
+    #[cfg(any(windows, test))]
+    codex_crash_recovery: Mutex<runtime::CrashRecoveryBudget>,
     session_titles: RwLock<HashMap<String, String>>,
     session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
     notification_title_cache: BlockingMutex<webhooks::NotificationTitleCache>,
@@ -254,6 +259,12 @@ fn load_config_or_defaults(store: &ConfigStore) -> (CodeyConfig, Option<String>)
     (CodeyConfig::default(), Some(message))
 }
 
+fn shared_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(5))
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::with_store(ConfigStore::default())
@@ -274,11 +285,10 @@ impl AppState {
             config_apply: BlockingMutex::new(config_apply::ApplyQueue::default()),
             model_delivery_lock: Mutex::new(()),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
-            http_client: reqwest::Client::builder()
-                .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(Duration::from_secs(5))
-                .build()
-                .expect("shared Codey HTTP client should be constructible"),
+            http_client: crate::system_proxy_client::SystemProxyClient::new_blocking(
+                shared_http_client_builder,
+            )
+            .expect("shared Codey HTTP client should be constructible"),
             official_proxied_clients: BlockingMutex::new(HashMap::new()),
             #[cfg(test)]
             webhook_http_client_override: None,
@@ -291,6 +301,7 @@ impl AppState {
             official_account_refresh_lock: Mutex::new(()),
             account_usage_cache: Arc::new(Mutex::new(account_usage::AccountUsageCaches::default())),
             runtime: Mutex::new(None),
+            failed_runtime_start: Mutex::new(None),
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_write_protection_active: AtomicBool::new(false),
@@ -307,6 +318,9 @@ impl AppState {
             shutting_down: AtomicBool::new(false),
             restart_task: Mutex::new(None),
             runtime_generation: AtomicU64::new(0),
+            runtime_intent: watch::channel(0).0,
+            #[cfg(any(windows, test))]
+            codex_crash_recovery: Mutex::new(runtime::CrashRecoveryBudget::default()),
             session_titles: RwLock::new(HashMap::new()),
             session_metadata_cache: BlockingMutex::new(
                 session_metadata::SessionMetadataCache::default(),
@@ -391,9 +405,17 @@ impl AppState {
         Some(prewarm.task)
     }
 
-    pub(crate) fn wechat_claw_login_http_client(&self) -> &reqwest::Client {
+    /// iLink 地址随渠道变化，按任意主机判定系统代理是否变化。
+    pub(crate) async fn wechat_claw_login_http_client(&self) -> reqwest::Client {
         self.wechat_claw_login_http_client
-            .get_or_init(wechat_claw_login_http_client)
+            .get_or_init(|| {
+                crate::system_proxy_client::SystemProxyClient::new_blocking(
+                    wechat_claw_login_http_client_builder,
+                )
+                .expect("create WeChat ClawBot login HTTP client")
+            })
+            .current_for_any_host()
+            .await
     }
 
     pub fn request_shutdown(&self) {
@@ -406,6 +428,7 @@ impl AppState {
 
     fn request_shutdown_with_reason(&self, reason: AppShutdownReason) {
         self.shutting_down.store(true, Ordering::Release);
+        self.cancel_pending_runtime_recovery();
         self.shutdown_reason.send_if_modified(|current| {
             if current.is_some() {
                 return false;
@@ -417,6 +440,11 @@ impl AppState {
 
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
+    }
+
+    fn cancel_pending_runtime_recovery(&self) {
+        self.runtime_intent
+            .send_modify(|intent| *intent = intent.wrapping_add(1));
     }
 
     pub async fn wait_for_shutdown(&self) -> AppShutdownReason {
@@ -456,6 +484,16 @@ impl AppState {
             "/session/wake-watcher" => {
                 self.session_scan_wake.notify_one();
                 json!({"status":"ok"})
+            }
+            "/session/portable-compaction/interrupt" => {
+                let runtime = self.runtime.lock().await.clone();
+                match runtime {
+                    Some(runtime) => runtime
+                        .interrupt_portable_compaction(&payload)
+                        .await
+                        .unwrap_or_else(api_error_message),
+                    None => api_error_message(anyhow::anyhow!("Codex 尚未启动")),
+                }
             }
             "/session/portable-compaction/prepare"
             | "/session/portable-compaction/status"
@@ -1630,39 +1668,26 @@ fn validate_codex_app_path(path: &str) -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), String> {
-    let configured_app_path = state.config.read().await.codex_app_path.trim().to_string();
-    let configured_path =
-        (!configured_app_path.is_empty()).then(|| PathBuf::from(configured_app_path.as_str()));
-    let resolved = tokio::task::spawn_blocking(move || {
-        // The launcher needs a startable executable, not merely a normalizable
-        // path: a stale or third-party directory must be reselected here instead
-        // of surfacing later as a bare spawn failure.
-        resolve_validated_codex_app_dir_with_saved_checked(configured_path.as_deref(), None)
-    })
-    .await
-    .map_err(|error| format!("检测 Codex 桌面应用目录的任务异常退出：{error}"))?;
-    if matches!(&resolved, Ok(Some(_))) {
+    let configured = state.config.read().await.clone();
+    // 与实际启动共用解析入口，先刷新 Store 注册包，再校验旧版本保存的路径。
+    let app_dir = match crate::launcher::resolve_configured_codex_app_dir(&configured).await {
+        Ok(app_dir) => app_dir,
+        Err(error) => {
+            eprintln!("定位 Codex 桌面应用失败：{error:#}");
+            let Some(selected) = select_codex_app_directory().await? else {
+                return Err(format!("{error:#}；已取消选择安装目录"));
+            };
+            validate_codex_app_path(&selected.to_string_lossy())?
+        }
+    };
+    if Path::new(configured.codex_app_path.trim()) == app_dir {
         return Ok(());
     }
-    let diagnostic = resolved.err().map(|error| format!("{error:#}"));
-    if let Some(error) = &diagnostic {
-        eprintln!("定位 Codex 桌面应用失败：{error}");
-    }
-
-    let Some(selected) = select_codex_app_directory().await? else {
-        let error = if configured_app_path.is_empty() {
-            CODEX_APP_NOT_FOUND_ERROR
-        } else {
-            CODEX_APP_PATH_INVALID_ERROR
-        };
-        return Err(format!(
-            "{}；已取消选择安装目录",
-            diagnostic.as_deref().unwrap_or(error)
-        ));
-    };
-    let app_dir = validate_codex_app_path(&selected.to_string_lossy())?;
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
+    if config.codex_app_path != configured.codex_app_path {
+        return Err("Codex 安装路径已变化，请重试启动".to_string());
+    }
     config.codex_app_path = app_dir.to_string_lossy().to_string();
     config.settings_revision = config.settings_revision.saturating_add(1);
     let config = save_config_to_store(state, config)
@@ -1919,6 +1944,7 @@ async fn save_codey_config_locked(
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
     config.protect_crashpad_pending = config_input.protect_crashpad_pending;
     config.slim_codex_pet = config_input.slim_codex_pet;
+    config.scope_guard = config_input.scope_guard;
     config.gpu_launch_mode = config_input.gpu_launch_mode;
     let codex_launch_proxy = config_input.codex_launch_proxy.trim();
     if !codex_launch_proxy.is_empty() {
@@ -3099,6 +3125,7 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.codex_launch_proxy != current.codex_launch_proxy
         || applied.fast_context_tools != current.fast_context_tools
         || applied.subagent_optimization != current.subagent_optimization
+        || applied.scope_guard != current.scope_guard
         || !applied
             .misc_model
             .trim()

@@ -65,6 +65,8 @@ use process::{codex_runtime_arguments, gpu_launch_arguments};
 
 const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
+// 页面明确答复桥接失效后，确认这一判断不必再等一整轮巡检。
+const CDP_WATCHDOG_UNHEALTHY_CONFIRM_INTERVAL: Duration = Duration::from_secs(5);
 // 页面端点对 CDP 命令完全没有回应：页面忙碌不成立，target 很可能已被替换。
 // 连续多轮无响应后重新发现 target，而不是一直当作"页面忙"等下去。
 const CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD: u8 = 3;
@@ -75,9 +77,17 @@ const CDP_WATCHDOG_INCONCLUSIVE_LIMIT: u8 = 6;
 // A completely unresponsive endpoint is a stronger signal than a busy page,
 // so it must rebuild sooner.
 const _: () = assert!(CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD < CDP_WATCHDOG_INCONCLUSIVE_LIMIT);
-// 每轮重装内部已自带整段发现阶段重试预算：连续这么多轮仍摸不到可注入
-// 页面时，调试端口就是随旧进程消失了，再重试只是在刷同样的超时。
+// 连续发现失败只能说明端点暂时不可达；降低重试频率，保留后续自动恢复。
 const CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT: u8 = 3;
+const CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(120);
+
+/// A probe that only confirms disappearance deliberately keeps the code unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexExit {
+    pub(crate) platform: &'static str,
+    pub(crate) exit_code: Option<i64>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectionHealth {
@@ -476,13 +486,19 @@ async fn run_startup_session_maintenance(
                     summary.deleted, summary.cleared_sessions
                 );
             }
+            // 失败日志按错误文本去重，不看上下文；同一错误的会话必须合并成一条，
+            // 否则同一次启动里第二个及之后的会话会被静默吞掉。
+            let mut failures = std::collections::BTreeMap::<String, Vec<String>>::new();
             for (session_id, message) in summary.failures {
+                failures.entry(message).or_default().push(session_id);
+            }
+            for (message, session_ids) in failures {
                 error_log::record_failure(
                     "patch_failed",
                     "reapply_message_deletion",
                     message,
                     serde_json::json!({
-                        "sessionId": session_id,
+                        "sessionIds": session_ids,
                     }),
                 );
             }
@@ -512,7 +528,7 @@ async fn run_startup_session_maintenance(
     Ok(session_maintenance_summary(&index_cleanup))
 }
 
-async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBuf> {
+pub(crate) async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBuf> {
     let configured_app_path = config.codex_app_path.trim();
     let configured_app_path_is_empty = configured_app_path.is_empty();
     let configured_app_path =
@@ -988,6 +1004,7 @@ async fn prepare_codex_startup_state(
         crate::codex_config::runtime_required_catalog_models(config, home, use_official_catalog);
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
+    let scope_guard = config.scope_guard;
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
     subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
@@ -1015,6 +1032,7 @@ async fn prepare_codex_startup_state(
                 subagent_model: &subagent_model,
                 subagent_reasoning_effort: &subagent_reasoning_effort,
                 subagent_roles: Some(&subagent_roles),
+                scope_guard,
                 stream_max_retries,
             },
         )
@@ -1245,6 +1263,7 @@ async fn stop_runtime_watcher(
 async fn stop_codex_processes(
     app_dir: &std::path::Path,
     process_id: Option<u32>,
+    #[cfg(windows)] renderer_websocket_url: Option<&str>,
     #[cfg(unix)] process_group_id: Option<u32>,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -1261,7 +1280,11 @@ async fn stop_codex_processes(
     }
     #[cfg(windows)]
     {
-        terminate_windows_codex_processes(app_dir, process_id).await
+        if let Some(websocket_url) = renderer_websocket_url {
+            stop_windows_codex_processes(app_dir, process_id, websocket_url).await
+        } else {
+            terminate_windows_codex_processes(app_dir, process_id).await
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1294,6 +1317,127 @@ struct RuntimeConfigRestoreContext<'a> {
     local_router_enabled: bool,
 }
 
+/// 启动尚未完成时也要保留整个进程树的清理责任，直到 stop 确认成功。
+pub(crate) struct PendingRuntimeCleanup {
+    home: PathBuf,
+    app_dir: PathBuf,
+    process_id: Option<u32>,
+    #[cfg(unix)]
+    process_group_id: Option<u32>,
+    child: Arc<Mutex<Option<Child>>>,
+    local_router_enabled: bool,
+    local_router: Mutex<Option<LocalRouter>>,
+}
+
+#[derive(Debug)]
+struct PendingStartupFailure {
+    cleanup: Arc<PendingRuntimeCleanup>,
+    message: String,
+}
+
+impl std::fmt::Debug for PendingRuntimeCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingRuntimeCleanup")
+            .field("app_dir", &self.app_dir)
+            .field("process_id", &self.process_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PendingStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PendingStartupFailure {}
+
+impl PendingRuntimeCleanup {
+    pub(crate) fn from_error(error: &anyhow::Error) -> Option<Arc<Self>> {
+        error
+            .downcast_ref::<PendingStartupFailure>()
+            .map(|failure| Arc::clone(&failure.cleanup))
+    }
+
+    pub(crate) async fn stop(&self) -> Result<()> {
+        let result = self
+            .stop_with_cleanup(
+                stop_codex_processes(
+                    &self.app_dir,
+                    self.process_id,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(unix)]
+                    self.process_group_id,
+                ),
+                restore_runtime_config_for_router_mode(&self.home, self.local_router_enabled),
+            )
+            .await;
+        if let Err(error) = &result {
+            error_log::record_failure(
+                "cleanup_failed",
+                "retry_failed_runtime_start_cleanup",
+                format!("{error:#}"),
+                serde_json::json!({"appPath": self.app_dir, "processId": self.process_id}),
+            );
+        }
+        result
+    }
+
+    async fn stop_with_cleanup(
+        &self,
+        process_stop: impl std::future::Future<Output = Result<()>>,
+        config_restore: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
+        process_stop.await.context("清理 Codex 遗留进程失败")?;
+        if let Some(child) = self.child.lock().await.take() {
+            reap_child_after_cleanup(child, "reap_child_after_failed_start_cleanup").await;
+        }
+        config_restore.await.context("恢复 Codex 配置失败")?;
+        let mut router = self.local_router.lock().await;
+        if let Some(router) = router.as_ref() {
+            router.stop().await.context("关闭本地线路路由失败")?;
+        }
+        router.take();
+        Ok(())
+    }
+
+    pub(crate) async fn reap_owned_child_before_exit(&self) -> Result<()> {
+        // 局部回收不完成进程树清理，不恢复配置，也不释放路由。
+        process::reap_owned_child_before_exit(&self.child).await
+    }
+}
+
+async fn cleanup_initial_renderer_failure(
+    cleanup: Arc<PendingRuntimeCleanup>,
+    error: anyhow::Error,
+    process_stop: impl std::future::Future<Output = Result<()>>,
+    config_restore: impl std::future::Future<Output = Result<()>>,
+) -> anyhow::Error {
+    match cleanup
+        .stop_with_cleanup(process_stop, config_restore)
+        .await
+    {
+        Ok(()) => error,
+        Err(stop_error) => {
+            error_log::record_failure(
+                "cleanup_failed",
+                injection_failure_cleanup_operation(),
+                format!("{stop_error:#}"),
+                serde_json::json!({"appPath": cleanup.app_dir, "processId": cleanup.process_id}),
+            );
+            PendingStartupFailure {
+                cleanup,
+                message: format!(
+                    "{error:#}；Codex 注入失败后的清理尚未完成，请退出残留 Codex 后重试：{stop_error:#}"
+                ),
+            }
+            .into()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn inject_initial_renderer(
     debug_port: u16,
@@ -1323,7 +1467,7 @@ async fn inject_initial_renderer(
         stage: Some("startup.renderer_injection".to_string()),
         recoverable: Some(false),
     };
-    let mut error = recovery::recoverable(failure.into_error());
+    let error = recovery::recoverable(failure.into_error());
     error_log::record_failure_with_metadata(
         "injection_failed",
         "inject_cdp_bridge",
@@ -1337,47 +1481,31 @@ async fn inject_initial_renderer(
         }),
     );
 
-    if let Err(stop_error) = stop_codex_processes(
-        app_dir,
-        spawned.process_id,
+    let cleanup = Arc::new(PendingRuntimeCleanup {
+        home: restore_context.home.to_path_buf(),
+        app_dir: app_dir.to_path_buf(),
+        process_id: spawned.process_id,
         #[cfg(unix)]
-        spawned.process_group_id,
-    )
-    .await
-    {
-        let context = serde_json::json!({
-            "appPath": app_dir,
-            "processId": spawned.process_id,
-        });
-        #[cfg(unix)]
-        let context = {
-            let mut context = context;
-            if let Some(context) = context.as_object_mut() {
-                context.insert(
-                    "processGroupId".to_string(),
-                    serde_json::json!(spawned.process_group_id),
-                );
-            }
-            context
-        };
-        error_log::record_failure(
-            "cleanup_failed",
-            injection_failure_cleanup_operation(),
-            format!("{stop_error:#}"),
-            context,
-        );
-        eprintln!("Codex 注入失败后的进程清理失败：{stop_error:#}");
-        error = anyhow::anyhow!(
-            "{error:#}；Codex 注入失败后的进程清理失败，请退出残留 Codex 后重试：{stop_error:#}"
-        );
-    }
-    if let Some(child) = child.lock().await.take() {
-        reap_child_after_cleanup(child, "reap_child_after_injection_failure").await;
-    }
-    Err(restore_runtime_config_after_error(
-        restore_context.home,
-        restore_context.local_router_enabled,
+        process_group_id: spawned.process_group_id,
+        child: Arc::clone(child),
+        local_router_enabled: restore_context.local_router_enabled,
+        local_router: Mutex::new(None),
+    });
+    Err(cleanup_initial_renderer_failure(
+        cleanup,
         error,
+        stop_codex_processes(
+            app_dir,
+            spawned.process_id,
+            #[cfg(windows)]
+            None,
+            #[cfg(unix)]
+            spawned.process_group_id,
+        ),
+        restore_runtime_config_for_router_mode(
+            restore_context.home,
+            restore_context.local_router_enabled,
+        ),
     )
     .await)
 }
@@ -1402,21 +1530,25 @@ fn spawn_injection_watchdog(
     let watchdog_websocket_url = websocket_url.clone();
     let watchdog_scripts = injection_scripts;
     let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(CDP_WATCHDOG_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
+        let mut retry_interval = CDP_WATCHDOG_INTERVAL;
         let mut target = injected_target;
         let mut failure_counters = InjectionFailureCounters::default();
         let mut reported_health: Option<InjectionHealth> = None;
-        // 连续停在目标枚举/选择阶段的重装轮数：Codex 在托管外重启（自更新、
-        // 单实例交接等）会带走调试端口，此后任何页面侧重试都不可能恢复，
-        // 到达阈值后把集成标记为停用并退出看门狗，不再无限烧重试。
         let mut endpoint_losses: u8 = 0;
+        let mut confirm_unhealthy = false;
         'watchdog: loop {
+            // 泵已结束而重建失败时不再监听，否则会跳过重试间隔空转。
+            let pump_running = !target.pump_finished();
+            let wait = if confirm_unhealthy {
+                CDP_WATCHDOG_UNHEALTHY_CONFIRM_INTERVAL
+            } else {
+                retry_interval
+            };
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => break,
-                _ = interval.tick() => {}
+                _ = target.pump_closed(), if pump_running => {}
+                _ = tokio::time::sleep(wait) => {}
             }
             // A finished message pump means the in-page bridge can no longer
             // reach the backend at all. Probing again cannot change that, so
@@ -1486,9 +1618,15 @@ fn spawn_injection_watchdog(
                 reported_health = Some(health);
             }
             if health == InjectionHealth::Healthy {
+                if endpoint_losses > 0 {
+                    *watchdog_statuses.write().await = target.injection_statuses();
+                }
                 endpoint_losses = 0;
+                retry_interval = CDP_WATCHDOG_INTERVAL;
             }
-            if !watchdog_should_reinject(&mut failure_counters, health) {
+            let reinject = watchdog_should_reinject(&mut failure_counters, health);
+            confirm_unhealthy = !reinject && health == InjectionHealth::Unhealthy;
+            if !reinject {
                 continue;
             }
             let reinjection = tokio::select! {
@@ -1520,28 +1658,33 @@ fn spawn_injection_watchdog(
                     previous.close().await;
                     failure_counters = InjectionFailureCounters::default();
                     endpoint_losses = 0;
+                    retry_interval = CDP_WATCHDOG_INTERVAL;
                 }
                 Err(error) => {
                     let endpoint_unreachable = error.debug_endpoint_unreachable();
                     let error_message = format!("{error:#}");
-                    error_log::record_failure_with_metadata_async(
-                        "injection_failed",
-                        "reinject_cdp_bridge",
-                        error_message.clone(),
-                        error_log::FailureMetadata {
-                            stage: Some("runtime.renderer_reinjection".to_string()),
-                            recoverable: Some(true),
-                        },
-                        serde_json::json!({
-                            "debugPort": debug_port,
-                            "lastError": error.detail(),
-                            "debugEndpointUnreachable": endpoint_unreachable,
-                        }),
-                    )
-                    .await;
-                    *watchdog_statuses.write().await = watchdog_scripts
-                        .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
-                    eprintln!("Codey CDP bridge 恢复失败：{error_message}");
+                    // 低频恢复中的相同端点故障不重复写错误日志；阶段变化仍记录。
+                    if !endpoint_unreachable || endpoint_losses < CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT {
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown_rx => break 'watchdog,
+                            _ = error_log::record_failure_with_metadata_async(
+                                "injection_failed",
+                                "reinject_cdp_bridge",
+                                error_message.clone(),
+                                error_log::FailureMetadata {
+                                    stage: Some("runtime.renderer_reinjection".to_string()),
+                                    recoverable: Some(true),
+                                },
+                                serde_json::json!({
+                                    "debugPort": debug_port,
+                                    "lastError": error.detail(),
+                                    "debugEndpointUnreachable": endpoint_unreachable,
+                                }),
+                            ) => {}
+                        }
+                        eprintln!("Codey CDP bridge 恢复失败：{error_message}");
+                    }
                     failure_counters = InjectionFailureCounters::after_failed_reinjection();
                     endpoint_losses = if endpoint_unreachable {
                         endpoint_losses.saturating_add(1)
@@ -1549,19 +1692,24 @@ fn spawn_injection_watchdog(
                         0
                     };
                     if endpoint_losses >= CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT {
-                        // 调试端口随旧进程消失后不会回来：继续探测只是反复
-                        // 制造同样的超时。把状态固定为停用说明；用户经 Codey
-                        // 重新拉起 Codex 时会走全新的注入与看门狗。
                         *watchdog_statuses.write().await = watchdog_scripts
-                            .statuses_with_error("Codex 已在 Codey 之外重启，集成已停用；通过 Codey 重新启动 Codex 后恢复");
-                        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                            "bridge.injection_disabled",
-                            serde_json::json!({
-                                "debugPort": debug_port,
-                                "consecutiveEndpointLosses": endpoint_losses,
-                            }),
+                            .statuses_with_error("Codex 调试连接暂时不可用，Codey 将继续自动恢复");
+                        if retry_interval != CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL {
+                            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                                "bridge.recovery_backoff",
+                                serde_json::json!({
+                                    "debugPort": debug_port,
+                                    "consecutiveEndpointLosses": endpoint_losses,
+                                    "retryIntervalMs": CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL.as_millis(),
+                                }),
+                            );
+                        }
+                        retry_interval = CDP_WATCHDOG_ENDPOINT_RETRY_INTERVAL;
+                    } else {
+                        *watchdog_statuses.write().await = watchdog_scripts.statuses_with_error(
+                            format!("脚本重新注入失败，将继续自动恢复：{error_message}"),
                         );
-                        break 'watchdog;
+                        retry_interval = CDP_WATCHDOG_INTERVAL;
                     }
                 }
             }
@@ -1608,7 +1756,7 @@ struct RuntimeWatchers {
     crashpad_guard_task: tokio::task::JoinHandle<()>,
     exit_watchdog_shutdown: oneshot::Sender<()>,
     exit_watchdog_task: tokio::task::JoinHandle<()>,
-    codex_exit: oneshot::Receiver<()>,
+    codex_exit: oneshot::Receiver<CodexExit>,
 }
 
 struct RuntimeWatcherInputs {
@@ -1838,6 +1986,7 @@ async fn prepare_native_runtime_state(
     let runtime_config_home = home.to_path_buf();
     let fast_context_tools = config.fast_context_tools;
     let subagent_optimization = config.subagent_optimization;
+    let scope_guard = config.scope_guard;
     let stream_max_retries = config.stream_max_retries;
     let native_subagent_config = config.clone();
     let applied = tokio::task::spawn_blocking(move || {
@@ -1859,6 +2008,7 @@ async fn prepare_native_runtime_state(
                 subagent_model: &native_subagent_config.subagent_model,
                 subagent_reasoning_effort: &native_subagent_config.subagent_reasoning_effort,
                 subagent_roles: Some(&native_subagent_config.subagent_roles),
+                scope_guard,
                 stream_max_retries,
             },
         )
@@ -1966,6 +2116,8 @@ async fn spawn_and_inject_runtime(
         config.subagent_optimization,
         config.misc_model_catalog_id(),
         CodexLaunchOptions {
+            #[cfg(windows)]
+            local_router_enabled: config.local_router_enabled,
             gpu_launch_mode: config.gpu_launch_mode,
             launch_proxy: launch_proxy.as_ref(),
         },
@@ -2132,6 +2284,17 @@ impl CodeyRuntime {
             .portable_compaction(operation, payload)
     }
 
+    pub(crate) async fn interrupt_portable_compaction(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.local_router
+            .as_ref()
+            .context("本地路由尚未启动")?
+            .interrupt_portable_compaction(payload)
+            .await
+    }
+
     pub(crate) fn revert_local_router_routes(&self, swap: local_router::RouterSnapshotSwap) {
         if let Some(local_router) = self.local_router.as_ref() {
             local_router.revert_config(swap);
@@ -2239,7 +2402,7 @@ impl CodeyRuntime {
         trace_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
         crashpad_pending_stats: CrashpadPendingStatsHandle,
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
-    ) -> Result<(Self, oneshot::Receiver<()>)> {
+    ) -> Result<(Self, oneshot::Receiver<CodexExit>)> {
         let mut stage_timings = StartupStageTimings::default();
         if !crate::codex_config::runtime_router_platform_supported() {
             return Err(anyhow::anyhow!(
@@ -2351,12 +2514,12 @@ impl CodeyRuntime {
         {
             Ok(spawned) => spawned,
             Err(error) => {
-                stop_local_router_after_failed_start(local_router.as_ref()).await;
-                return Err(recovery::after_integration_failure(
+                return Err(finish_failed_runtime_start(
+                    error,
+                    local_router,
                     home,
                     &recovery_app_dir,
                     config.local_router_enabled,
-                    error,
                 )
                 .await);
             }
@@ -2418,10 +2581,14 @@ impl CodeyRuntime {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        #[cfg(windows)]
+        let renderer_websocket_url = self.injection_websocket_url.read().await.clone();
         self.stop_with_cleanup(
             stop_codex_processes(
                 &self.codex_app_path,
                 self.process_id,
+                #[cfg(windows)]
+                Some(&renderer_websocket_url),
                 #[cfg(unix)]
                 self.process_group_id,
             ),
@@ -2508,6 +2675,21 @@ impl CodeyRuntime {
         }
         local_router_stop.context("关闭本地线路路由失败")
     }
+}
+
+async fn finish_failed_runtime_start(
+    error: anyhow::Error,
+    local_router: Option<LocalRouter>,
+    home: &std::path::Path,
+    app_dir: &std::path::Path,
+    local_router_enabled: bool,
+) -> anyhow::Error {
+    if let Some(cleanup) = PendingRuntimeCleanup::from_error(&error) {
+        *cleanup.local_router.lock().await = local_router;
+        return error;
+    }
+    stop_local_router_after_failed_start(local_router.as_ref()).await;
+    recovery::after_integration_failure(home, app_dir, local_router_enabled, error).await
 }
 
 /// 启动失败时路由已经在监听。直接 Drop 会中止 accept 任务，来不及排空
@@ -2704,6 +2886,9 @@ async fn restore_runtime_config_after_error(
     local_router_enabled: bool,
     error: anyhow::Error,
 ) -> anyhow::Error {
+    if PendingRuntimeCleanup::from_error(&error).is_some() {
+        return error;
+    }
     match restore_runtime_config_for_router_mode(home, local_router_enabled).await {
         Ok(()) => error,
         Err(restore_error) => {
@@ -2720,6 +2905,9 @@ mod subagent_model_tests;
 
 #[cfg(test)]
 mod model_delivery_test_support;
+
+#[cfg(test)]
+mod watchdog_recovery_tests;
 
 #[cfg(all(test, unix))]
 mod tests;

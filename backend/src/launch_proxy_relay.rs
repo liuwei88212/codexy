@@ -69,6 +69,7 @@ impl UpstreamProxy {
     }
 
     /// 不带凭据的展示地址，用于错误信息。
+    #[cfg(test)]
     fn display_addr(&self) -> String {
         match self.host.parse::<std::net::IpAddr>() {
             Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", self.host, self.port),
@@ -164,13 +165,12 @@ pub(crate) async fn ensure_running(upstream: &UpstreamProxy) -> anyhow::Result<u
             }
         }),
     };
-    // 仅同一上游等待初始化；探活失败或调用被取消后，后续调用可重试。
+    // 只启动回环监听；代理连接和认证交给实际请求，避免阻断控制台启动。
     let running = relay
         .relay
         .as_ref()
         .expect("中继注册引用仅在退出时释放")
         .get_or_try_init(|| async {
-            preflight(upstream).await?;
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .context("启动 Codex 代理认证中继失败")?;
@@ -189,9 +189,8 @@ fn spawn_relay(
     Ok(RunningRelay { port, task })
 }
 
-/// 启动前先探活上游：代理连不通时立刻报错，而不是让 Codex 带着死代理
-/// 静默挂起。https 顺带完成 TLS 握手，SOCKS 上游顺带完成认证协商，凭据
-/// 错误在此暴露。
+/// 独立验证代理连接和认证边界，不作为客户端启动条件。
+#[cfg(test)]
 pub(crate) async fn preflight(upstream: &UpstreamProxy) -> anyhow::Result<()> {
     let result = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, async {
         match upstream.scheme {
@@ -846,20 +845,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrelated_upstreams_initialize_while_socks_preflight_waits() {
+    async fn unrelated_upstreams_initialize_without_contacting_the_proxy() {
         let slow_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let slow = upstream(&format!(
             "socks5://user:pass@{}",
             slow_listener.local_addr().unwrap()
         ));
-        let pending = tokio::spawn({
-            let slow = slow.clone();
-            async move { ensure_running(&slow).await }
-        });
-        let (mut connection, _) = test_deadline(slow_listener.accept()).await.unwrap();
-        test_deadline(connection.read_exact(&mut [0; 4]))
-            .await
-            .unwrap();
+        let slow_port = test_deadline(ensure_running(&slow)).await.unwrap();
 
         let fast_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let fast = upstream(&format!(
@@ -868,11 +860,11 @@ mod tests {
         ));
         let port = test_deadline(ensure_running(&fast)).await.unwrap();
         assert!(port > 0);
-        assert!(!pending.is_finished());
-        pending.abort();
-        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_ne!(slow_port, port);
+        assert!(tokio::time::timeout(Duration::from_millis(50), slow_listener.accept()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), fast_listener.accept()).await.is_err());
         let mut relays = RELAYS.lock().unwrap();
-        assert!(!relays.contains_key(&slow.raw));
+        relays.remove(&slow.raw);
         relays.remove(&fast.raw);
     }
 
@@ -883,18 +875,12 @@ mod tests {
             "socks5://user:pass@{}",
             listener.local_addr().unwrap()
         ));
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream.read_exact(&mut [0; 4]).await.unwrap();
-            stream.write_all(&[0x05, 0x00]).await.unwrap();
-            // 只处理一次探活；重复初始化将无法成功。
-        });
         let (first, second) = test_deadline(async {
             tokio::join!(ensure_running(&upstream), ensure_running(&upstream))
         })
         .await;
         assert_eq!(first.unwrap(), second.unwrap());
-        server.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
         RELAYS.lock().unwrap().remove(&upstream.raw);
     }
 
@@ -912,8 +898,9 @@ mod tests {
                 stream.write_all(&[0x05, method]).await.unwrap();
             }
         });
-        assert!(test_deadline(ensure_running(&upstream)).await.is_err());
+        assert!(test_deadline(preflight(&upstream)).await.is_err());
         assert!(!RELAYS.lock().unwrap().contains_key(&upstream.raw));
+        test_deadline(preflight(&upstream)).await.unwrap();
         let port = test_deadline(ensure_running(&upstream)).await.unwrap();
         test_deadline(TcpStream::connect((Ipv4Addr::LOCALHOST, port)))
             .await
@@ -923,42 +910,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_initializer_retries_after_first_caller_is_cancelled() {
+    async fn unavailable_upstream_keeps_the_relay_available_for_later_requests() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let upstream = upstream(&format!(
             "socks5://user:pass@{}",
             listener.local_addr().unwrap()
         ));
-        let first = tokio::spawn({
-            let upstream = upstream.clone();
-            async move { ensure_running(&upstream).await }
-        });
-        let (mut first_stream, _) = test_deadline(listener.accept()).await.unwrap();
-        test_deadline(first_stream.read_exact(&mut [0; 4]))
+        drop(listener);
+        let port = test_deadline(ensure_running(&upstream)).await.unwrap();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
             .await
             .unwrap();
-        let second = tokio::spawn({
-            let upstream = upstream.clone();
-            async move { ensure_running(&upstream).await }
-        });
-        test_deadline(async {
-            loop {
-                if Arc::strong_count(RELAYS.lock().unwrap().get(&upstream.raw).unwrap()) == 3 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
-        assert!(RELAYS.lock().unwrap().contains_key(&upstream.raw));
-        let (mut second_stream, _) = test_deadline(listener.accept()).await.unwrap();
-        test_deadline(second_stream.read_exact(&mut [0; 4]))
-            .await
-            .unwrap();
-        second_stream.write_all(&[0x05, 0x00]).await.unwrap();
-        assert!(test_deadline(second).await.unwrap().unwrap() > 0);
+        let mut response = Vec::new();
+        // Windows 连接拒绝可能晚于本地监听建立，按实际请求的连接预算等待。
+        tokio::time::timeout(
+            UPSTREAM_CONNECT_TIMEOUT + Duration::from_secs(2),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502"));
+        assert!(!String::from_utf8_lossy(&response).contains("user:pass"));
+        assert_eq!(test_deadline(ensure_running(&upstream)).await.unwrap(), port);
         RELAYS.lock().unwrap().remove(&upstream.raw);
     }
 
@@ -1003,7 +979,7 @@ mod tests {
         ));
         let pending = tokio::spawn({
             let upstream = upstream.clone();
-            async move { ensure_running(&upstream).await }
+            async move { preflight(&upstream).await }
         });
         let (mut connection, _) = test_deadline(listener.accept()).await.unwrap();
         test_deadline(connection.read_exact(&mut [0; 4]))
@@ -1291,7 +1267,7 @@ mod tests {
             stream.write_all(&[0x01, 0x01]).await.unwrap();
         });
         let upstream = upstream(&format!("socks5://user:wrong@{address}"));
-        let error = ensure_running(&upstream).await.unwrap_err();
+        let error = preflight(&upstream).await.unwrap_err();
         assert!(format!("{error:#}").contains("认证失败"), "{error:#}");
     }
 }

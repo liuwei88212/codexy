@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error_log;
 
+#[cfg(any(windows, test))]
+mod app_quit;
+#[cfg(windows)]
+pub(crate) use app_quit::request_app_quit;
+
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,6 +58,8 @@ const PET_CONTROL_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/pet-control-shield.js");
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/security-warning-shield.js");
+const QUOTA_NOTICE_DISMISS_SCRIPT: &str =
+    include_str!("../../dist-overlay/inject/quota-notice-dismiss.js");
 const QUOTA_UNLOCK_SCRIPT: &str = include_str!("../../dist-overlay/inject/quota-unlock.js");
 pub(crate) const SETTINGS_OVERLAY_SCRIPT: &str =
     include_str!("../../dist-overlay/codey-overlay.js");
@@ -197,11 +204,8 @@ pub struct InjectedTarget {
 pub struct InjectionRetryFailure {
     error: anyhow::Error,
     detail: Option<String>,
-    /// 重试终止时所处的阶段：一直停在发现阶段意味着调试端点本身已不可达，
-    /// 看门狗据此把「页面修不好」与「Codex 已在托管外重启」分开处理。
-    final_phase: InjectionPhase,
-    /// 进入过桥接安装及之后阶段的失败轮数：非零说明端点曾经可达。
-    reached_bridge_stage: u32,
+    /// 包括预取在内，只要曾成功枚举目标，就保留端点可达的证据。
+    reached_debug_endpoint: bool,
 }
 
 impl InjectionRetryFailure {
@@ -215,11 +219,10 @@ impl InjectionRetryFailure {
         self.detail.as_deref()
     }
 
-    /// 整轮重试都停在枚举/选择目标阶段：调试端口已随旧进程消失，或当前
-    /// 进程里没有任何可注入页面——在这条会话上继续重试不可能恢复。
-    /// 只要有一轮摸到过桥接阶段就说明端点活着，不再适用。
+    /// 本轮重试及预取均未成功枚举目标。页面暂时缺失或桥接失败不会被归为
+    /// 端点不可达；后续恢复策略仍需继续观察 Codex 的状态。
     pub fn debug_endpoint_unreachable(&self) -> bool {
-        self.final_phase.is_discovery() && self.reached_bridge_stage == 0
+        !self.reached_debug_endpoint
     }
 }
 
@@ -252,6 +255,10 @@ impl InjectedTarget {
     /// 结束时页面内的桥接调用再也无法送达后端，重新注入是唯一出路。
     pub fn pump_finished(&self) -> bool {
         self.pump.is_finished()
+    }
+
+    pub async fn pump_closed(&self) {
+        self.pump.finished().await;
     }
 
     pub async fn close(self) {
@@ -335,6 +342,17 @@ pub fn prepare_injection_scripts(
                     )
                 }
             ),
+            Feature,
+        ),
+        (
+            "quota-notice-dismiss",
+            "额度提示关闭",
+            QUOTA_NOTICE_DISMISS_SCRIPT,
+            r#"window.__codeyQuotaNoticeDismissInstalled === true
+              && typeof window.__codeyQuotaNoticeDismiss?.scan === "function"
+              && typeof window.__codeyQuotaNoticeDismiss?.dismiss === "function"
+              ? "额度提示关闭按钮已就绪" : """#
+                .to_string(),
             Feature,
         ),
         (
@@ -423,6 +441,7 @@ pub fn prepare_injection_scripts(
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
             + SECURITY_WARNING_SHIELD_SCRIPT.len()
+            + QUOTA_NOTICE_DISMISS_SCRIPT.len()
             + QUOTA_UNLOCK_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
             + PROMPT_OPTIMIZE_SCRIPT.len()
@@ -679,12 +698,7 @@ pub async fn retry_inject_with_scripts(
             }
         }
     };
-    Err(InjectionRetryFailure {
-        error: last_error,
-        detail: Some(detail),
-        final_phase: InjectionPhase::from_raw(phase.load(Ordering::Acquire)),
-        reached_bridge_stage: stats.bridge_failures(),
-    })
+    Err(stats.into_failure(last_error, detail))
 }
 
 fn prefetch_handoff_deadline(
@@ -731,6 +745,21 @@ impl InjectionRetryStats {
         self.phase_failures[phase as usize] += 1;
         self.failure_expense_ms += cost.as_millis() as u64;
         self.last_failure_phase = Some(phase);
+    }
+
+    fn into_failure(self, error: anyhow::Error, detail: String) -> InjectionRetryFailure {
+        // 进入目标选择就说明枚举已成功；之后再次枚举失败也不能抹去该证据。
+        let reached_debug_endpoint = self.phase_failures[InjectionPhase::SelectTarget as usize..]
+            .iter()
+            .any(|count| *count > 0)
+            || self
+                .prefetch
+                .is_some_and(|prefetch| prefetch.reached_debug_endpoint);
+        InjectionRetryFailure {
+            error,
+            detail: Some(detail),
+            reached_debug_endpoint,
+        }
     }
 
     fn discovery_failures(&self) -> u32 {
@@ -1112,6 +1141,8 @@ struct RequestGateVerdict {
     #[serde(default)]
     module_gate: bool,
     #[serde(default)]
+    host_managed: bool,
+    #[serde(default)]
     patch_present: bool,
 }
 
@@ -1145,6 +1176,7 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
     polls,
     sourceGate: window.__codeyModelRequestSourceGateInstalled === true,
     moduleGate: window.__codeyModelRequestModuleGateInstalled === true,
+    hostManaged: window.__codeyAppServerManagerHosted === true,
   });
   for (;;) {
     if (!patchPresent()) {
@@ -1293,6 +1325,9 @@ fn record_request_gate_verdict(
     // sourceGate/moduleGate 区分源码补丁、模块级 DI 直取与 React 遍历三条
     // 就绪路径；patchSession 记录补丁服务是否赶在首个文档前挂上该页面，
     // attachedBeforeLoad 为 false 时主 bundle 没有补丁，属于预期内的降级。
+    // hostManaged 表示请求由桌面宿主进程发出，页面里的源码门禁不在请求路径上：
+    // 线路由 CLI 输入中继固定，跨线路交接改由输入框发送入口的补丁完成，
+    // sourceGate 不代表请求已被页面校验。
     let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
         event,
         serde_json::json!({
@@ -1303,6 +1338,7 @@ fn record_request_gate_verdict(
             "settleMs": settle_ms,
             "sourceGate": verdict.source_gate,
             "moduleGate": verdict.module_gate,
+            "hostManaged": verdict.host_managed,
             "patchSession": crate::renderer_asset_patch::page_stats(target_id),
         }),
     );
@@ -2018,10 +2054,32 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
   }
   if (existing?.__codeyLazyLoader) return;
 
+  // 高于后端连接加求值的预算；桥接失联时不能让加载永远挂起、吞掉后续点击。
+  const loadTimeoutMs = 15000;
   let loading = null;
+  let opening = false;
   const formatError = (error) => error instanceof Error
     ? `${error.name}: ${error.message}`
     : String(error || "未知错误");
+  const readyOverlay = () => {
+    const overlay = window.__codeySettingsOverlay;
+    return overlay && overlay !== proxy && typeof overlay.toggle === "function"
+      ? overlay
+      : null;
+  };
+  const requestLoad = (retried) => Promise.resolve(
+    window.__codexSessionDeleteBridge(loadPath, {}, { timeoutMs: loadTimeoutMs }),
+  ).then((result) => {
+    // 看门狗重建桥接会以 bridge_reinstalled 结束旧调用，新桥接已可用，重发一次。
+    if (result?.code === "bridge_reinstalled" && !retried) return requestLoad(true);
+    // 后端求值超时后页面仍可能执行完脚本，以浮层是否就绪为准。
+    const overlay = readyOverlay();
+    if (overlay) return overlay;
+    if (!result || result.status !== "ok") {
+      throw new Error(result?.message || "配置面板加载请求失败");
+    }
+    throw new Error(window.__codeyOverlayError || "未生成浮层控制器");
+  });
   const proxy = {
     __codeyLazyLoader: true,
     close() {},
@@ -2031,17 +2089,10 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
       if (typeof window.__codexSessionDeleteBridge !== "function") {
         return Promise.reject(new Error("Codey bridge 尚未就绪"));
       }
-      loading = Promise.resolve(
-        window.__codexSessionDeleteBridge(loadPath, {}),
-      ).then((result) => {
-        if (!result || result.status !== "ok") {
-          throw new Error(result?.message || "配置面板加载请求失败");
-        }
-        const overlay = window.__codeySettingsOverlay;
-        if (!overlay || overlay === proxy || typeof overlay.toggle !== "function") {
-          throw new Error(window.__codeyOverlayError || "未生成浮层控制器");
-        }
-        return overlay;
+      // 失败的加载不能留在缓存里，否则悬停预加载失败后点击再也无法重试。
+      loading = requestLoad(false).catch((error) => {
+        loading = null;
+        throw error;
       });
       return loading;
     },
@@ -2049,15 +2100,18 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
       this.toggle();
     },
     toggle() {
-      if (loading) return;
+      // 预加载进行中的点击等同一次加载完成后再打开，只防止重复打开。
+      if (opening) return;
+      opening = true;
       void this.load().then((overlay) => {
         if (typeof overlay.open === "function") overlay.open();
         else overlay.toggle();
       }).catch((error) => {
         const message = formatError(error);
         window.__codeyOverlayError = message;
-        loading = null;
         window.alert(`Codey 内嵌配置面板加载失败：${message}`);
+      }).finally(() => {
+        opening = false;
       });
     },
   };
@@ -2368,21 +2422,60 @@ assert.equal(nextPage.window.attempts, 1);
     }
 
     #[test]
-    fn endpoint_unreachable_only_when_no_attempt_reached_the_bridge() {
-        let failure = |phase: InjectionPhase, reached_bridge_stage: u32| InjectionRetryFailure {
-            error: anyhow::anyhow!("x"),
-            detail: None,
-            final_phase: phase,
-            reached_bridge_stage,
-        };
-        // 调试端口死掉：每轮都停在发现阶段。
-        assert!(failure(InjectionPhase::DiscoverTargets, 0).debug_endpoint_unreachable());
-        assert!(failure(InjectionPhase::SelectTarget, 0).debug_endpoint_unreachable());
-        // 有一轮摸到过桥接阶段——端点当时活着，不算托管外重启。
-        assert!(!failure(InjectionPhase::DiscoverTargets, 1).debug_endpoint_unreachable());
-        // 最后一轮卡在桥接安装（端点还活着只是会话坏了）同样不适用。
-        assert!(!failure(InjectionPhase::InstallBridge, 1).debug_endpoint_unreachable());
-        assert!(!failure(InjectionPhase::VerifyReadiness, 2).debug_endpoint_unreachable());
+    fn endpoint_unreachable_only_when_every_attempt_failed_to_enumerate_targets() {
+        for (phases, unreachable) in [
+            (vec![InjectionPhase::DiscoverTargets; 3], true),
+            (vec![InjectionPhase::SelectTarget], false),
+            (
+                vec![
+                    InjectionPhase::SelectTarget,
+                    InjectionPhase::DiscoverTargets,
+                ],
+                false,
+            ),
+            (vec![InjectionPhase::InstallBridge], false),
+            (vec![InjectionPhase::VerifyReadiness], false),
+            (vec![InjectionPhase::ReadStatuses], false),
+            (
+                vec![
+                    InjectionPhase::InstallBridge,
+                    InjectionPhase::DiscoverTargets,
+                ],
+                false,
+            ),
+        ] {
+            let mut stats = InjectionRetryStats::default();
+            for phase in &phases {
+                stats.attempts += 1;
+                stats.record_failure(*phase, Duration::from_millis(10));
+            }
+            let failure = stats.into_failure(anyhow::anyhow!("x"), "detail".to_string());
+            assert_eq!(
+                failure.debug_endpoint_unreachable(),
+                unreachable,
+                "{phases:?}"
+            );
+            assert_eq!(failure.detail(), Some("detail"));
+        }
+    }
+
+    #[test]
+    fn endpoint_unreachable_preserves_successful_prefetch_enumeration() {
+        for reached_debug_endpoint in [false, true] {
+            let mut prefetch = crate::target_prefetch::PrefetchDiagnostics::default();
+            prefetch.reached_debug_endpoint = reached_debug_endpoint;
+            prefetch.last_discovery_error = Some("listTargets: connectionRefused".to_string());
+            let mut stats = InjectionRetryStats {
+                prefetch: Some(prefetch),
+                ..Default::default()
+            };
+            stats.record_failure(InjectionPhase::DiscoverTargets, Duration::from_millis(10));
+            let failure = stats.into_failure(anyhow::anyhow!("x"), "detail".to_string());
+            assert_eq!(
+                failure.debug_endpoint_unreachable(),
+                !reached_debug_endpoint
+            );
+        }
     }
 
     async fn mock_request_gate(
@@ -3279,7 +3372,7 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 11);
+        assert_eq!(prepared.descriptors.len(), 12);
         let user_script = prepared
             .descriptors
             .iter()
@@ -3290,10 +3383,16 @@ const run = async (patch, waitMs = 40, onPending = () => {}) => {
             prepared.descriptors[0].visibility,
             InjectionScriptVisibility::Internal
         );
-        assert_eq!(prepared.descriptors[5].id, "renderer-controls");
+        assert_eq!(prepared.descriptors[6].id, "renderer-controls");
         assert_eq!(
-            prepared.descriptors[5].visibility,
+            prepared.descriptors[6].visibility,
             InjectionScriptVisibility::Internal
+        );
+        assert!(
+            prepared
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.id == "quota-notice-dismiss")
         );
         assert!(
             prepared

@@ -31,9 +31,19 @@ use crate::error_log;
 const RENDERER_ASSET_PATCH_SCRIPT: &str = include_str!("renderer_asset_patch.js");
 const CHATGPT_WINDOW_SCRIPT: &str = include_str!("../../public/chatgpt-window.js");
 /// 需要改写的脚本名前缀，与页面侧 isCodexRendererAssetUrl 的名单保持一致。
-const PATCHABLE_ASSET_PREFIXES: [&str; 3] = ["app-initial", "app-primary", "app-shared"];
-/// 仅在关闭宠物时改写的设置页脚本。
-const PET_ASSET_PREFIXES: [&str; 1] = ["pets-settings"];
+const PATCHABLE_ASSET_PREFIXES: [&str; 9] = [
+    "app-initial",
+    "app-primary",
+    "app-shared",
+    "codex-composer-adapter",
+    "initialize-app-host-services",
+    "renderer-app-server-managers",
+    "send-follow-up-message",
+    "start-turn",
+    "webview-page",
+];
+/// 仅在关闭宠物时改写的脚本：设置页预览资源，以及决定是否预热隐藏浮窗的运行时。
+const PET_ASSET_PREFIXES: [&str; 2] = ["pets-settings", "app-runtime"];
 /// 等 Codex 调试端点就绪的总预算；超时后由下一次注入重新拉起服务。
 const CONNECT_BUDGET: Duration = Duration::from_secs(60);
 /// 端点未就绪时的重连间隔：主窗口通常在端点出现后数百毫秒内导航，间隔要短。
@@ -511,6 +521,20 @@ async fn on_attached(connection: BrowserConnection, context: Arc<ServiceContext>
     {
         log_service_event(
             "renderer_asset_patch.fetch_enable_failed",
+            json!({ "targetId": target_id, "message": format!("{error:#}") }),
+        );
+    }
+    // 窗口入口与资产是否命中补丁缓存无关；新文档和已打开页面都必须安装。
+    if let Err(error) = connection
+        .call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": CHATGPT_WINDOW_SCRIPT, "runImmediately": true }),
+            Some(session_id),
+        )
+        .await
+    {
+        log_service_event(
+            "renderer_asset_patch.chatgpt_window_install_failed",
             json!({ "targetId": target_id, "message": format!("{error:#}") }),
         );
     }
@@ -1051,6 +1075,11 @@ mod tests {
             let fetch = self.expect("Fetch.enable").await;
             assert_eq!(fetch["sessionId"], session);
             self.reply(&fetch, json!({})).await;
+            let document = self.expect("Page.addScriptToEvaluateOnNewDocument").await;
+            assert_eq!(document["sessionId"], session);
+            assert_eq!(document["params"]["runImmediately"], true);
+            assert_eq!(document["params"]["source"], CHATGPT_WINDOW_SCRIPT);
+            self.reply(&document, json!({ "identifier": "chatgpt-window" })).await;
         }
 
         async fn finish(mut self) {
@@ -1112,6 +1141,16 @@ mod tests {
                 .is_err()
         );
         service.reply(&fetch, json!({})).await;
+        let document = service.expect("Page.addScriptToEvaluateOnNewDocument").await;
+        assert_eq!(document["sessionId"], "page-session");
+        assert_eq!(document["params"]["runImmediately"], true);
+        assert_eq!(document["params"]["source"], CHATGPT_WINDOW_SCRIPT);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), service.socket.next())
+                .await
+                .is_err()
+        );
+        service.reply(&document, json!({ "identifier": "chatgpt-window" })).await;
         let resume = service.expect("Runtime.runIfWaitingForDebugger").await;
         assert_eq!(resume["sessionId"], "page-session");
         assert!(

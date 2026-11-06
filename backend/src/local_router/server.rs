@@ -292,10 +292,8 @@ impl LocalRouter {
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
             portable_history_cache: Arc::new(Mutex::new(PortableHistoryCache::default())),
             idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
-            // 系统证书与代理配置加载是同步操作，不占用路由的异步工作线程。
-            client: tokio::task::spawn_blocking(|| upstream_http_client_builder().build())
+            client: SystemProxyClient::new(upstream_http_client_builder)
                 .await
-                .context("创建 Codey 本地路由 HTTP 客户端任务异常退出")?
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
             proxied_clients: Mutex::new(HashMap::new()),
             official_auth_path,
@@ -604,7 +602,11 @@ async fn run_router_listener(
                             request_id.clone(),
                             ROUTER_REQUEST_STARTED_AT.scope(Instant::now(), async move {
                                 let _admitted = admitted;
-                                if let Err(error) = server.handle_connection(stream).await {
+                                // 客户端提前断开（取消请求、关闭会话）是正常结束，不记为失败。
+                                if let Err(error) = server.handle_connection(stream).await
+                                    && !error.is::<DownstreamClosed>()
+                                    && !error.is::<CompactionInterrupted>()
+                                {
                                     record_router_failure_nonblocking(
                                         "local_router_request_failed",
                                         "handle_local_router_connection",
@@ -888,7 +890,8 @@ pub(crate) struct RouterServer {
     pub(crate) native_history_cache: Arc<Mutex<NativeHistoryCache>>,
     pub(crate) portable_history_cache: Arc<Mutex<PortableHistoryCache>>,
     pub(crate) idle_downstreams: Arc<Mutex<IdleDownstreamRegistry>>,
-    pub(crate) client: reqwest::Client,
+    /// 未配置线路代理时共用的默认客户端，随系统代理变化重建。
+    pub(crate) client: SystemProxyClient,
     /// 按代理地址缓存的线路专用客户端，保留连接池复用。上限内缓存，
     /// 超出后清空重建（代理地址变更是罕见操作，代价仅为重建连接）。
     pub(crate) proxied_clients: Mutex<HashMap<String, reqwest::Client>>,
@@ -905,14 +908,22 @@ pub(crate) struct RouterServer {
 const MAX_PROXIED_CLIENTS: usize = 8;
 
 impl RouterServer {
+    /// 线路地址无效时直接返回当前客户端，错误留给后续发送步骤报告。
+    pub(crate) async fn default_client(&self, route: &RouteTarget) -> reqwest::Client {
+        match route.upstream_url.as_deref() {
+            Ok(url) => self.client.current(url).await,
+            Err(_) => self.client.cached(),
+        }
+    }
+
     /// 选择线路的上游 HTTP 客户端：未配置代理的线路共用默认客户端（遵循
     /// 系统代理），配置了上游代理的线路使用仅走该代理的专用客户端。
-    pub(crate) fn upstream_client(
+    pub(crate) async fn upstream_client(
         &self,
         route: &RouteTarget,
     ) -> std::result::Result<reqwest::Client, String> {
         let Some(proxy) = route.upstream_proxy.as_deref() else {
-            return Ok(self.client.clone());
+            return Ok(self.default_client(route).await);
         };
         let mut clients = self
             .proxied_clients
@@ -964,6 +975,7 @@ pub(crate) struct RouteBindings {
     pub(crate) portable_source_retries: HashMap<String, PortableSourceRetry>,
     pub(crate) portable_tickets: HashMap<String, PortableTicket>,
     pub(crate) compacting: HashSet<String>,
+    pub(crate) compaction_operations: HashMap<Uuid, Arc<CompactionOperation>>,
     pub(crate) routes: HashMap<String, RouteBinding>,
     pub(crate) order: VecDeque<(String, u64)>,
     pub(crate) next_generation: u64,
@@ -1257,20 +1269,20 @@ impl RouterSnapshot {
                 Some(crate::route_request_log::RouteCheckRejection::RouteMissing);
         }
         let model = model.trim();
-        if !model.is_empty() {
-            if let Some(candidates) = self.raw_models.get(&model_id::key(upstream_model)) {
-                if candidates.len() > 1 {
-                    record_decision(&mut decision, Reason::AmbiguousModel, candidates.len());
-                    anyhow::bail!("模型 {model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
-                }
-                if let Some(candidate) = candidates.first() {
-                    record_decision(&mut decision, Reason::UniqueCandidate, 1);
-                    return self.target_for_route_model(
-                        &candidate.provider_id,
-                        &candidate.model,
-                        requested_model,
-                    );
-                }
+        if !model.is_empty()
+            && let Some(candidates) = self.raw_models.get(&model_id::key(upstream_model))
+        {
+            if candidates.len() > 1 {
+                record_decision(&mut decision, Reason::AmbiguousModel, candidates.len());
+                anyhow::bail!("模型 {model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
+            }
+            if let Some(candidate) = candidates.first() {
+                record_decision(&mut decision, Reason::UniqueCandidate, 1);
+                return self.target_for_route_model(
+                    &candidate.provider_id,
+                    &candidate.model,
+                    requested_model,
+                );
             }
         }
         if let Some(decision) = decision.as_deref_mut() {

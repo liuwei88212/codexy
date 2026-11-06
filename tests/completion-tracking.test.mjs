@@ -432,6 +432,38 @@ test("reconciles the current session through AppServerManager without a completi
   assert.equal(events.length, 1);
 });
 
+test("uses the visible retained session for initial reconciliation", async () => {
+  const events = [];
+  const hidden = new FakeElement({
+    "data-response-annotation-conversation": "session-hidden",
+  });
+  hidden.layoutHidden = true;
+  const visible = new FakeElement({
+    "data-response-annotation-conversation": "session-visible",
+  });
+  const selector = [
+    "[data-above-composer-conversation-id]",
+    "[data-session-id]",
+    "[data-conversation-id]",
+    "[data-thread-id]",
+    "[data-request-user-input-auto-resolution-conversation-id]",
+    "[data-response-annotation-conversation]",
+  ].join(", ");
+  loadInjection({
+    codexSessionController: createRecoveryController(events),
+    sessionElements: {
+      [selector]: [hidden, visible],
+    },
+  });
+
+  await flushMicrotasks();
+
+  assert.deepEqual(
+    events.map((event) => event.payload.conversationId),
+    ["session-visible"],
+  );
+});
+
 test("reconciles when the conversation appears after renderer startup", async () => {
   const events = [];
   const runtime = loadInjection({
@@ -443,12 +475,19 @@ test("reconciles when the conversation appears after renderer startup", async ()
   assert.equal(events.length, 0);
 
   runtime.setSessionId("session-1");
-  runtime.emitMutations([{
+  const mutation = {
     type: "childList",
     target: new FakeElement(),
     addedNodes: [],
     removedNodes: [],
-  }]);
+  };
+  // The session lookup reads layout, so mutation batches defer it to a timer.
+  runtime.emitMutations([mutation]);
+  runtime.emitMutations([mutation]);
+  await flushMicrotasks();
+  assert.equal(events.length, 0);
+
+  runtime.flushTimers();
   await flushMicrotasks();
 
   assert.deepEqual(events.map((event) => event.payload.conversationId), ["session-1"]);
@@ -553,6 +592,113 @@ test("native model routing retries unexported registry discovery and caches sour
     runtime.window.__codeyCodexSessionController = null;
     assert.equal((await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" })).manager, manager);
     assert.equal(fetches, unavailable === "fetch" ? 2 : 1, "deletion reuses the successful source resolver");
+  }
+});
+
+function loadCachedManagerInjection(managers, { inherited = false, mounted = true } = {}) {
+  const runtime = loadInjection({ initialSessionId: "" });
+  const families = managers.map(() => ({ kind: "signal-family" }));
+  const bindings = new Map(families.map((family) => [family, new Map(mounted ? [["local", {}]] : [])]));
+  const reads = [];
+  const node = { familyBindings: bindings };
+  const scope = {
+    query: null,
+    node: inherited ? { familyBindings: new Map() } : node,
+    chain: new Map(inherited ? [["parent", node]] : []),
+    get(family, hostId) {
+      assert.equal(hostId, "local");
+      assert.ok(bindings.get(family)?.has(hostId), "discovery must not initialize an unused signal");
+      reads.push(family);
+      return managers[families.indexOf(family)];
+    },
+    set() { throw Error("discovery must not change signals"); },
+    watch() { throw Error("discovery must not create RPC watchers"); },
+    when() {},
+  };
+  runtime.document.body.__reactFiber$cachedManager = {
+    memoizedState: { scope },
+    return: null,
+  };
+  runtime.document.scripts.push({ src: "app://-/assets/app-initial-private-registry.js" });
+  runtime.window.__codeyImportCodexAsset = async () => ({});
+  return { ...runtime, reads };
+}
+
+test("native model routing discovers a cached manager when its registry is no longer exported", async () => {
+  for (const inherited of [false, true]) {
+    const client = { hostId: "local", enqueueRequest() { throw Error("must not send"); }, createRequest() {}, onResult() {} };
+    const manager = { requestClient: client, sendRequest() { throw Error("must not send"); } };
+    const runtime = loadCachedManagerInjection([manager], { inherited });
+    assert.equal(await runtime.window.__codeyLoadCodexRequestClient(), client);
+    assert.equal(await runtime.window.__codeyLoadCodexRequestClient(), client);
+    assert.equal(runtime.window.__codeyPageCapabilities.modelRouting.status, "available");
+    assert.equal(runtime.reads.length, 1, "reuse the verified manager on subsequent calls");
+  }
+});
+
+test("React manager discovery enumerates an object shared by many fibers once per scan", () => {
+  const runtime = loadInjection({ initialSessionId: "" });
+  let enumerations = 0;
+  const shared = new Proxy(Object.fromEntries(Array.from({ length: 2_000 }, (_, index) => [`k${index}`, index])), {
+    ownKeys(target) {
+      enumerations += 1;
+      return Reflect.ownKeys(target);
+    },
+  });
+  const manager = { sendRequest() { throw Error("must not send"); } };
+  const scope = { query: null, get() {}, set() {}, watch() {}, when() {} };
+  let fiber = { memoizedState: { scope }, memoizedProps: { shared }, return: null };
+  for (let depth = 1; depth < 24; depth += 1) {
+    fiber = { memoizedProps: { shared }, return: fiber };
+  }
+  runtime.document.body.__reactFiber$shared = fiber;
+  const found = runtime.window.__codeyAppServerManagerFromReact((candidate, hostId) => (
+    candidate === scope && hostId === "local" ? manager : null
+  ));
+  assert.equal(found, manager, "the deepest fiber is still scanned");
+  assert.equal(enumerations, 1);
+});
+
+test("background completion reconcile backs off longer than other failed capabilities", async () => {
+  for (const [feature, capMs] of [["reconcile", 300_000], ["usage", 30_000]]) {
+    const runtime = loadInjection({ initialSessionId: "" });
+    let discoveries = 0;
+    runtime.document.scripts.push({ src: "app://-/assets/app-initial-unsupported.js" });
+    runtime.window.__codeyImportCodexAsset = async () => {
+      discoveries += 1;
+      return {};
+    };
+    const load = () => runtime.window.__codeyLoadCodexSessionController({ feature });
+    for (let failure = 0; failure < 10; failure += 1) {
+      await assert.rejects(load(), /暂不支持/);
+      runtime.advanceTime(600_000);
+    }
+    await assert.rejects(load(), /暂不支持/);
+    assert.equal(discoveries, 11, `${feature} retries after each expired backoff`);
+    runtime.advanceTime(capMs - 1);
+    await assert.rejects(load(), /暂不支持/);
+    assert.equal(discoveries, 11, `${feature} skips discovery inside its backoff cap`);
+    runtime.advanceTime(1);
+    await assert.rejects(load(), /暂不支持/);
+    assert.equal(discoveries, 12, `${feature} rediscovers once its backoff cap expires`);
+  }
+});
+
+test("cached manager discovery rejects remote, incomplete, ambiguous, and unmounted clients", async () => {
+  const manager = (hostId = "local") => ({
+    requestClient: { hostId, enqueueRequest() {}, createRequest() {}, onResult() {} },
+    sendRequest() { throw Error("must not send"); },
+  });
+  for (const [managers, options] of [
+    [[manager("remote")], {}],
+    [[{ requestClient: { hostId: "local" }, sendRequest() {} }], {}],
+    [[manager(), manager()], {}],
+    [[manager()], { mounted: false }],
+  ]) {
+    const runtime = loadCachedManagerInjection(managers, options);
+    await assert.rejects(runtime.window.__codeyLoadCodexRequestClient(), /模型请求校验/);
+    assert.equal(runtime.window.__codeyPageCapabilities.modelRouting.status, "unavailable");
+    if (options.mounted === false) assert.equal(runtime.reads.length, 0);
   }
 });
 
@@ -2880,4 +3026,283 @@ test("imports from the tasks header using the project stored in the file", async
     projectPath: "",
   });
   assert.equal(button.disabled, false);
+});
+
+// Codex 26.1027+ keeps AppServerManager in the desktop host. Its RPC stub is a
+// callable proxy: every property looks callable, only the prototype is real.
+function fakeRpcStub(handlers) {
+  const proto = Object.create(Function.prototype, {
+    dup: { value() { return this; } },
+    onRpcBroken: { value() {} },
+  });
+  const target = Object.setPrototypeOf(function stub() {}, proto);
+  return new Proxy(target, {
+    get: (stubTarget, key) => (Object.hasOwn(handlers, key) ? handlers[key] : Reflect.get(stubTarget, key)),
+  });
+}
+
+function loadHostedManagerInjection(handlers, options = {}) {
+  const runtime = loadInjection({ initialSessionId: "", ...options });
+  const connection = { kind: "signal-family" };
+  const account = { kind: "signal-family" };
+  const calls = [];
+  const rpcHandlers = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, (...args) => {
+    calls.push([name, ...args]);
+    return Promise.resolve().then(() => handler(...args));
+  }]));
+  let current = { status: "ready", client: { hostId: "local", rpc: fakeRpcStub(rpcHandlers) } };
+  let connectionReads = 0;
+  const scope = {
+    query: null,
+    node: { familyBindings: new Map([[account, new Map([["local", {}]])], [connection, new Map([["local", {}]])]]) },
+    chain: new Map(),
+    get(family, hostId) {
+      assert.equal(hostId, "local");
+      if (family === account) return { hostId, rpc: fakeRpcStub({}) };
+      assert.equal(family, connection);
+      connectionReads += 1;
+      return current;
+    },
+    set() { throw Error("discovery must not change signals"); },
+    watch() { throw Error("discovery must not create RPC watchers"); },
+    when() {},
+  };
+  runtime.document.body.__reactFiber$hosted = { memoizedState: { scope }, return: null };
+  runtime.document.scripts.push({ src: "app://-/assets/app-initial-hosted.js" });
+  let imports = 0;
+  runtime.window.__codeyImportCodexAsset = async () => {
+    imports += 1;
+    return {};
+  };
+  return {
+    ...runtime,
+    calls,
+    connectionReads: () => connectionReads,
+    imports: () => imports,
+    setConnection: (value) => { current = value; },
+  };
+}
+
+test("hosted AppServerManager serves MCP reload, usage, and refresh through its RPC stub", async () => {
+  const runtime = loadHostedManagerInjection({
+    sendRequest: (method) => ({ method }),
+    refreshRecentConversations: () => undefined,
+  });
+  assert.equal((await runtime.window.__codeyReloadMcpServers()).ok, true);
+  assert.deepEqual(await runtime.window.__codeyReadAccountRateLimits(), { method: "account/rateLimits/read" });
+  const refresh = await runtime.window.__codeyLoadCodexSessionController({ feature: "refresh" });
+  await refresh.refreshRecentConversations();
+  assert.deepEqual(JSON.parse(JSON.stringify(runtime.calls)), [
+    ["sendRequest", "config/mcpServer/reload", {}],
+    ["sendRequest", "account/rateLimits/read"],
+    ["refreshRecentConversations"],
+  ]);
+  assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "available");
+  assert.equal(runtime.imports(), 0, "a hosted manager needs no asset imports");
+
+  // A host reconnect replaces the stub; calls follow the current connection.
+  const replaced = [];
+  runtime.setConnection({ status: "ready", client: { hostId: "local", rpc: fakeRpcStub({ sendRequest: (method) => replaced.push(method) }) } });
+  await runtime.window.__codeyReloadMcpServers();
+  assert.deepEqual(replaced, ["config/mcpServer/reload"]);
+  runtime.setConnection({ status: "disconnected", client: null });
+  await assert.rejects(runtime.window.__codeyReloadMcpServers(), /宿主会话接口未连接/);
+});
+
+test("hosted AppServerManager rejects page-only capabilities once without rescanning", async () => {
+  const runtime = loadHostedManagerInjection({ sendRequest: () => assert.fail("must not send") });
+  for (const feature of ["modelRouting", "modelRouting"]) {
+    await assert.rejects(
+      runtime.window.__codeyLoadCodexSessionController({ feature }),
+      (error) => error.code === "codey_capability_unavailable" && /桌面宿主进程/.test(error.message),
+    );
+  }
+  await assert.rejects(runtime.window.__codeyLoadCodexRequestClient(), /模型请求校验/);
+  assert.equal(runtime.connectionReads(), 1, "only the first discovery scans React");
+  assert.equal(runtime.imports(), 0);
+});
+
+function hostedReconcileHandlers(overrides = {}) {
+  const state = { execution: { inProgress: true, activeTurnId: "turn-1" }, role: { role: "owner" }, status: "idle", unsubscribed: false };
+  const handlers = {
+    getThreadExecutionState: () => state.execution,
+    getStreamRole: () => state.role,
+    sendRequest: (method, params) => {
+      assert.equal(method, "thread/read");
+      assert.deepEqual({ ...params }, { threadId: "thread-1", includeTurns: false });
+      return { thread: { status: typeof state.status === "function" ? state.status() : { type: state.status } } };
+    },
+    getConversationCwd: () => "/repo",
+    unsubscribeInactiveConversation: () => {
+      state.unsubscribed = true;
+      state.execution = { inProgress: false, activeTurnId: "turn-1" };
+    },
+    resumeConversation: () => {},
+    ...overrides,
+  };
+  return { state, handlers };
+}
+
+async function runHostedReconcile(runtime) {
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "reconcile" });
+  const pending = controller.reconcileCompletedConversation({
+    conversationId: "thread-1",
+    model: null,
+    workspaceRoots: [],
+  });
+  for (let round = 0; round < 4; round += 1) {
+    await flushMicrotasks();
+    runtime.flushTimers();
+  }
+  return pending;
+}
+
+test("hosted completion reconcile confirms idle twice, then unsubscribes and resumes the thread", async () => {
+  const { handlers } = hostedReconcileHandlers();
+  const runtime = loadHostedManagerInjection(handlers);
+  assert.equal(await runHostedReconcile(runtime), true);
+  const names = runtime.calls.map(([name]) => name);
+  assert.ok(names.indexOf("unsubscribeInactiveConversation") < names.indexOf("resumeConversation"));
+  assert.equal(names.at(-1), "getThreadExecutionState", "the result reflects the resumed state");
+  assert.equal(names.filter((name) => name === "sendRequest").length, 2, "native status is read twice");
+  const resume = runtime.calls.find(([name]) => name === "resumeConversation")[1];
+  assert.deepEqual({ ...resume, workspaceRoots: [...resume.workspaceRoots] }, {
+    conversationId: "thread-1",
+    model: null,
+    workspaceRoots: ["/repo"],
+  });
+  assert.equal(runtime.window.__codeyPageCapabilities.reconcile.status, "available");
+});
+
+test("hosted completion reconcile leaves live, pending, follower, changing, and unowned threads alone", async () => {
+  let reads = 0;
+  for (const [label, setup] of [
+    ["still running", ({ state }) => { state.status = "active"; }],
+    ["pending submission has no turn id", ({ state }) => { state.execution = { inProgress: true, activeTurnId: null }; }],
+    ["follower window", ({ state }) => { state.role = { role: "follower" }; }],
+    ["status changes between reads", ({ state }) => {
+      state.status = () => ({ type: reads++ === 0 ? "idle" : "active" });
+    }],
+    ["new turn between reads", ({ state, handlers }) => {
+      let executions = 0;
+      handlers.getThreadExecutionState = () => ({ inProgress: true, activeTurnId: executions++ === 0 ? "turn-1" : "turn-2" });
+      void state;
+    }],
+    ["host skips the unsubscribe", ({ handlers }) => {
+      handlers.unsubscribeInactiveConversation = () => {};
+    }],
+  ]) {
+    reads = 0;
+    const fixture = hostedReconcileHandlers();
+    setup(fixture);
+    const runtime = loadHostedManagerInjection(fixture.handlers);
+    assert.equal(await runHostedReconcile(runtime), false, label);
+    const names = runtime.calls.map(([name]) => name);
+    assert.ok(!names.includes("resumeConversation"), `${label}: no resume`);
+    if (label !== "host skips the unsubscribe") {
+      assert.ok(!names.includes("unsubscribeInactiveConversation"), `${label}: no unsubscribe`);
+    }
+  }
+});
+
+function hostedDeletionHandlers(overrides = {}) {
+  const state = { execution: { inProgress: false, activeTurnId: null }, role: { role: "owner" } };
+  const handlers = {
+    getThreadExecutionState: () => state.execution,
+    getStreamRole: () => state.role,
+    unsubscribeInactiveConversation: () => {},
+    sendRequest: (method, params) => {
+      assert.equal(method, "thread/unsubscribe");
+      assert.deepEqual({ ...params }, { threadId: "thread-1" });
+      return { status: "unsubscribed" };
+    },
+    getConversationCwd: () => "/repo",
+    resumeConversation: () => ({ status: "ready" }),
+    discardConversationFromCache: () => {},
+    refreshRecentConversations: () => {},
+    ...overrides,
+  };
+  return { state, handlers };
+}
+
+test("hosted message deletion releases the thread before files change and reloads the rewritten history afterwards", async () => {
+  const { handlers } = hostedDeletionHandlers();
+  const runtime = loadHostedManagerInjection(handlers);
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  await controller.prepareMessageDeletion("thread-1");
+  // The host call updates its own state; the direct call covers streams it skips.
+  assert.deepEqual(runtime.calls.map(([name, arg]) => name === "sendRequest" ? arg : name), [
+    "getThreadExecutionState", "getStreamRole", "unsubscribeInactiveConversation", "thread/unsubscribe",
+  ]);
+  runtime.calls.length = 0;
+  // Host resume merges loaded turns back in; evicting the cache makes the open
+  // view reload the rewritten history, and the list refresh restores its row.
+  await controller.finishMessageDeletion("thread-1", ["turn-1"]);
+  assert.deepEqual(runtime.calls.map(([name, arg]) => [name, arg]), [
+    ["discardConversationFromCache", "thread-1"], ["refreshRecentConversations", undefined],
+  ]);
+  runtime.calls.length = 0;
+  // A failed delete changes no files; restore the stream without dropping the view.
+  await controller.finishMessageDeletion("thread-1", []);
+  assert.ok(!runtime.calls.some(([name]) => name === "discardConversationFromCache"));
+  const resume = runtime.calls.find(([name]) => name === "resumeConversation")[1];
+  assert.deepEqual({ ...resume, workspaceRoots: [...resume.workspaceRoots] }, {
+    conversationId: "thread-1", model: null, reasoningEffort: null, workspaceRoots: ["/repo"],
+  });
+  assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "available");
+});
+
+test("hosted message deletion leaves running, unloaded, and follower threads untouched", async () => {
+  for (const [label, setup, pattern] of [
+    ["running", ({ state }) => { state.execution = { inProgress: true, activeTurnId: "turn-1" }; }, /仍在运行/],
+    ["follower", ({ state }) => { state.role = { role: "follower" }; }, /拥有当前会话的窗口/],
+    ["not loaded", ({ state }) => { state.execution = null; }, /尚未加载/],
+  ]) {
+    const fixture = hostedDeletionHandlers();
+    setup(fixture);
+    const runtime = loadHostedManagerInjection(fixture.handlers);
+    const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+    await assert.rejects(controller.prepareMessageDeletion("thread-1"), pattern, label);
+    assert.ok(!runtime.calls.some(([name]) => name === "unsubscribeInactiveConversation" || name === "sendRequest"), label);
+  }
+  const notReady = hostedDeletionHandlers({ resumeConversation: () => ({ status: "not-ready", reason: "inactive-window" }) });
+  const notReadyRuntime = loadHostedManagerInjection(notReady.handlers);
+  const notReadyController = await notReadyRuntime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  await assert.rejects(notReadyController.finishMessageDeletion("thread-1", []), /无法重新载入/);
+});
+
+test("a reinjected script replaces a cached hosted adapter that lacks deletion", async () => {
+  const { handlers } = hostedDeletionHandlers();
+  const runtime = loadHostedManagerInjection(handlers);
+  runtime.window.__codeyCodexSessionController = { kind: "manager", manager: { codeyHostedAppServerManager: true, sendRequest() {} } };
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  assert.equal(typeof controller.prepareMessageDeletion, "function");
+});
+
+test("hosted deletion hides the deleted turns at once and reloads the conversation behind them", async () => {
+  const events = [];
+  const { handlers } = hostedDeletionHandlers({
+    sendRequest: () => { events.push("unsubscribe"); return { status: "unsubscribed" }; },
+    discardConversationFromCache: (id) => { events.push(`discard:${id}`); },
+    refreshRecentConversations: () => { events.push("refresh"); },
+  });
+  const runtime = loadHostedManagerInjection(handlers, {
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1"],
+    bridgeHandler: async (path) => {
+      if (path !== "/session/delete-messages") return { status: "ok" };
+      events.push("persist");
+      return { status: "ok", deleted: 1 };
+    },
+  });
+  runtime.setSessionId("session-1");
+  const controller = await runtime.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  assert.equal(controller.reloadsConversationAfterDeletion, true);
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.deepEqual(events, ["unsubscribe", "persist", "discard:session-1", "refresh"]);
+  // Until the host reloads, the stale row stays hidden instead of reappearing.
+  assert.equal(runtime.getTurnRow(0).dataset.codeyHardDeleted, "true");
+  assert.equal(runtime.getTurnRow(1).dataset.codeyHardDeleted, undefined);
+  assert.deepEqual(runtime.alerts, []);
+  assert.equal(runtime.getReloadCount(), 0);
 });

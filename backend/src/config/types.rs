@@ -730,6 +730,10 @@ pub struct CodeyConfig {
     /// the next runtime. Disabled by default and restored on shutdown.
     #[serde(default)]
     pub subagent_optimization: bool,
+    /// Injects Codey's proportionality rule into new and compacted Codex
+    /// sessions and spawned subagents through runtime hooks. Opt-in.
+    #[serde(default)]
+    pub scope_guard: bool,
     /// Default model used by newly spawned subagents while Codey's
     /// multi-agent optimization is enabled.
     #[serde(default = "default_subagent_model")]
@@ -871,6 +875,7 @@ impl Default for CodeyConfig {
             codex_launch_proxy: String::new(),
             fast_context_tools: false,
             subagent_optimization: false,
+            scope_guard: false,
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),
@@ -935,17 +940,17 @@ pub(super) fn default_subagent_reasoning_effort() -> String {
     DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
 }
 
-pub(super) const DEFAULT_UPDATE_BASE_URL: &str =
-    "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
-const DEFAULT_RELEASE_ADMIN_URL: &str = "https://codey-release-admin.kimzane9991.workers.dev";
+pub(crate) const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/liuwei88212/codexy/releases";
 
 pub(super) fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
-    let base_url = configured_base_url
+    let Some(base_url) = configured_base_url
         .map(str::trim)
         .filter(|url| !url.is_empty())
-        .unwrap_or(DEFAULT_UPDATE_BASE_URL)
-        .trim_end_matches('/');
-    format!("{base_url}/latest.json")
+    else {
+        return GITHUB_RELEASES_URL.to_string();
+    };
+    format!("{}/latest.json", base_url.trim_end_matches('/'))
 }
 
 pub fn default_update_manifest_url() -> String {
@@ -956,7 +961,7 @@ pub fn default_release_admin_url() -> String {
     option_env!("CODEY_RELEASE_ADMIN_URL")
         .map(str::trim)
         .filter(|url| !url.is_empty())
-        .unwrap_or(DEFAULT_RELEASE_ADMIN_URL)
+        .unwrap_or_default()
         .trim_end_matches('/')
         .to_string()
 }

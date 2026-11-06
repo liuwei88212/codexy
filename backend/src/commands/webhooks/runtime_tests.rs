@@ -114,43 +114,58 @@ async fn stored_delivery_states(state: &AppState) -> Vec<String> {
     .unwrap()
 }
 
-async fn wait_for_delivered(state: &AppState, expected: usize) {
-    wait_for_delivery_states(expected, || stored_delivery_states(state)).await;
-}
-
-async fn wait_for_delivery_states<F, Fut>(expected: usize, mut read_states: F)
+async fn wait_for_delivery_states<F, Fut>(expected: usize, mut read_states: F) -> Result<(), String>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Vec<String>>,
 {
     let mut delivered = 0;
-    let mut states = Vec::new();
+    let mut last_progress = tokio::time::Instant::now();
     loop {
-        // 每次确认都需要完整磁盘同步；限制停滞时间，不限制整批投递的吞吐量。
-        // 只有成功数量严格增加才重新计时，最多等待 expected 次进展。
-        let progress = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                states = read_states().await;
-                assert_eq!(
-                    states.len(),
-                    expected,
-                    "unexpected delivery rows: {states:?}"
-                );
-                let completed = states.iter().filter(|state| *state == "delivered").count();
-                if completed == expected || completed > delivered {
-                    break completed;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        delivered = progress.unwrap_or_else(|_| {
-            panic!("delivery results stalled: delivered {delivered}/{expected}, states={states:?}")
-        });
-        if delivered == expected {
-            break;
+        // 先拿到完整快照再判断进展，不能在慢磁盘读取中途用旧快照判定停滞。
+        let states = tokio::time::timeout(Duration::from_secs(10), read_states())
+            .await
+            .map_err(|_| "delivery state read timed out".to_string())?;
+        assert_eq!(states.len(), expected, "unexpected delivery rows: {states:?}");
+        let completed = states.iter().filter(|state| *state == "delivered").count();
+        if completed == expected {
+            return Ok(());
         }
+        if completed > delivered {
+            delivered = completed;
+            last_progress = tokio::time::Instant::now();
+            continue;
+        } else if last_progress.elapsed() >= Duration::from_secs(3) {
+            return Err(format!(
+                "delivery results stalled: delivered {delivered}/{expected}, states={states:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+async fn wait_for_new_session_discovery<F, Fut>(
+    expected: usize,
+    mut read_states: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Vec<String>>,
+{
+    let mut states = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            states = read_states().await;
+            if states.len() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+            format!("new indexed sessions were not enqueued within 5 s: expected={expected}, states={states:?}")
+    })
 }
 
 #[tokio::test(start_paused = true)]
@@ -165,18 +180,56 @@ async fn delivery_wait_accepts_progress_across_slow_durable_commits() {
             vec!["delivered".into(), "delivered".into()]
         };
         async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
             states
         }
     })
-    .await;
-    assert_eq!(started.elapsed(), Duration::from_secs(4));
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(8));
+}
+
+#[tokio::test(start_paused = true)]
+async fn delivery_wait_bounds_a_stuck_storage_read() {
+    let started = tokio::time::Instant::now();
+    let result = wait_for_delivery_states(1, || std::future::pending()).await;
+    assert_eq!(result.unwrap_err(), "delivery state read timed out");
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
 }
 
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "delivery results stalled: delivered 1/2")]
 async fn delivery_wait_repeated_states_do_not_extend_the_stall_deadline() {
-    wait_for_delivery_states(2, || async { vec!["delivered".into(), "inflight".into()] }).await;
+    wait_for_delivery_states(2, || async { vec!["delivered".into(), "inflight".into()] })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_discovery_deadline_excludes_serialized_delivery_settlement() {
+    let started = tokio::time::Instant::now();
+    wait_for_new_session_discovery(2, || async {
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        vec!["delivered".into(), "pending".into()]
+    })
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_millis(3500));
+    wait_for_delivery_states(2, || async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        vec!["delivered".into(), "delivered".into()]
+    })
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_millis(5500));
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_discovery_deadline_requires_every_indexed_session() {
+    let started = tokio::time::Instant::now();
+    let result = wait_for_new_session_discovery(2, || async { vec!["delivered".into()] }).await;
+    assert!(result.is_err());
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
 }
 
 #[tokio::test]
@@ -186,7 +239,16 @@ async fn slow_http_does_not_block_enqueue_and_concurrency_is_global_across_event
     let channels = (0..7)
         .map(|i| server.channel(&format!("channel-{i}")))
         .collect();
-    let state = channel_delivery_test_state(directory.path(), channels);
+    let mut state = channel_delivery_test_state(directory.path(), channels);
+    // 网络保持挂起，给完整磁盘同步留出独立期限，避免把慢落盘误判成等待 HTTP。
+    Arc::get_mut(&mut state).unwrap().webhook_http_client_override = Some(
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+    );
     let worker = delivery::start(Arc::clone(&state)).await.unwrap();
     let payload = json!({"sessionId":"session","turnId":"first","sessionName":"First", "confirmedByRollout":true});
     notify_webhook_completion(&state, &payload).await.unwrap();
@@ -194,7 +256,7 @@ async fn slow_http_does_not_block_enqueue_and_concurrency_is_global_across_event
     assert_eq!(server.active.load(Ordering::SeqCst), 4);
     let second = json!({"sessionId":"session","turnId":"second","sessionName":"Second", "confirmedByRollout":true});
     let queued = tokio::time::timeout(
-        Duration::from_millis(250),
+        Duration::from_secs(5),
         notify_webhook_completion(&state, &second),
     )
     .await
@@ -204,11 +266,12 @@ async fn slow_http_does_not_block_enqueue_and_concurrency_is_global_across_event
     assert_eq!(server.received.load(Ordering::SeqCst), 4);
     assert_eq!(stored_delivery_states(&state).await.len(), 14);
     server.gate.add_permits(14);
-    wait_for_delivered(&state, 14).await;
-    assert_eq!(server.peak.load(Ordering::SeqCst), 4);
-    assert_eq!(server.channel_peak.load(Ordering::SeqCst), 1);
+    let delivered = wait_for_delivery_states(14, || stored_delivery_states(&state)).await;
     state.notification_delivery_stop.send_replace(true);
     worker.await.unwrap();
+    delivered.unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(server.peak.load(Ordering::SeqCst), 4);
+    assert_eq!(server.channel_peak.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -511,7 +574,8 @@ async fn assert_native_new_session_delivery(commit_delay: Duration, two_database
     }
     let scan = start_recent_session_scan_at(Default::default(), home.clone());
     start_waiting_webhook_watcher(&state, scan).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // 只是等待启动扫描结束，不是延迟断言；全量并行测试时阻塞线程池会排队。
+    tokio::time::timeout(Duration::from_secs(10), async {
         while state.notification_outbox.get().is_none() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -566,26 +630,28 @@ async fn assert_native_new_session_delivery(commit_delay: Duration, two_database
     for database in &databases {
         database.execute_batch("COMMIT;").unwrap();
     }
-    let delivered = tokio::time::timeout(Duration::from_secs(2), async {
-        while server.requests.lock().await.len() < databases.len() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await;
-    let latency = committed_at.elapsed();
-    if delivered.is_ok() {
-        wait_for_delivered(&state, databases.len()).await;
-    }
+    // 原生发现还包含索引合并和多次完整落盘，给慢磁盘留出五秒入队期限。
+    // 同一渠道逐条认领、发送和完整同步确认，整批 HTTP 请求不共用发现期限。
+    let discovered =
+        wait_for_new_session_discovery(databases.len(), || stored_delivery_states(&state)).await;
+    let discovery_latency = committed_at.elapsed();
+    let delivered = if discovered.is_ok() {
+        wait_for_delivery_states(databases.len(), || stored_delivery_states(&state)).await
+    } else {
+        Ok(())
+    };
+    let delivery_latency = committed_at.elapsed();
     // 失败时也回收原生监听和发送任务，然后报告实际收到的请求数。
     stop_waiting_webhook_watcher(&state).await;
     let requests = server.requests.lock().await;
     assert!(
-        delivered.is_ok(),
-        "new indexed sessions did not reach the local webhook within 2 s: requests={}, indexes={}, states={:?}",
+        discovered.is_ok(),
+        "{discovered:?}: requests={}, indexes={}, states={:?}",
         requests.len(),
         databases.len(),
         stored_delivery_states(&state).await
     );
+    delivered.unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(requests.len(), databases.len());
     assert!(
         requests
@@ -600,7 +666,7 @@ async fn assert_native_new_session_delivery(commit_delay: Duration, two_database
         );
     }
     eprintln!(
-        "new session native delivery: indexes={}, commit_delay={commit_delay:?}, latency={latency:?}",
+        "new session native delivery: indexes={}, commit_delay={commit_delay:?}, discovery={discovery_latency:?}, delivery={delivery_latency:?}",
         databases.len()
     );
     drop(writers);

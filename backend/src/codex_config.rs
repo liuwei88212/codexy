@@ -15,8 +15,9 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, 
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, ROOT_AGENT_COLLABORATION_USAGE_HINT,
     ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
-    SUBAGENT_GUIDANCE, SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
-    remove_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
+    ROOT_AGENT_MULTI_AGENT_MODE_HINT_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
+    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
+    remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -71,7 +72,7 @@ const CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS: i64 = 300;
 const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
 const APPLIED_HOOKS_JSON_FILE: &str = "applied-hooks.json";
 const CODEY_CONSTRAINTS_DIR: &str = "codex-constraints";
-const CODEY_ROOT_INSTRUCTIONS_FILE: &str = "root-instructions.md";
+const CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE: &str = "root-instructions.md";
 const CODEY_FASTCTX_INSTRUCTIONS_FILE: &str = "fastctx-instructions.md";
 const CODEY_COLLABORATION_HINT_FILE: &str = "collaboration-hint.md";
 const CODEY_SUBAGENT_SOURCE_FILE: &str = "subagent.toml";
@@ -226,6 +227,7 @@ pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub subagent_model: &'a str,
     pub subagent_reasoning_effort: &'a str,
     pub subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
+    pub scope_guard: bool,
     pub stream_max_retries: u32,
 }
 
@@ -257,6 +259,7 @@ struct RouterApplyOptions<'a> {
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
     subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
+    scope_guard: bool,
     marker: &'a Path,
     backup_root: &'a Path,
 }
@@ -319,6 +322,7 @@ pub(crate) fn apply_runtime_router_config(
             subagent_model: options.subagent_model,
             subagent_reasoning_effort: options.subagent_reasoning_effort,
             subagent_roles: options.subagent_roles,
+            scope_guard: options.scope_guard,
             marker: &marker,
             backup_root: &backup_root,
         },
@@ -326,6 +330,7 @@ pub(crate) fn apply_runtime_router_config(
     if let Some(local_router) = options.local_router {
         persist_runtime_router_disk_provider_or_rollback(home, &marker, local_router)?;
     }
+    crate::subagent_gate::spawn_stale_session_state_sweep(home);
     Ok(applied)
 }
 
@@ -402,6 +407,7 @@ fn apply_isolated_runtime_router_config(
         subagent_model,
         subagent_reasoning_effort,
         subagent_roles,
+        scope_guard,
         marker,
         backup_root,
     } = options;
@@ -451,6 +457,7 @@ fn apply_isolated_runtime_router_config(
             subagent_optimization,
             subagent_model,
             subagent_reasoning_effort,
+            scope_guard,
             local_router,
         },
     )?;
@@ -491,20 +498,20 @@ fn apply_isolated_runtime_router_config(
     } else {
         Vec::new()
     };
-    let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
+    // Desktop replaces config `developer_instructions` with its own per-thread
+    // text, so root guidance travels only in the multi-agent hints.
+    crate::fs_util::remove_file_if_exists(
+        &constraints_dir.join(CODEY_RETIRED_ROOT_INSTRUCTIONS_FILE),
+    )?;
+    let (collaboration_hint, runtime_agents) = if subagent_optimization {
         // Every file under `codex-constraints/` is Codey's own asset and is
         // rewritten from the current definitions; nothing there needs an
         // upgrade path. Only text injected into Codex's `config.toml` keeps
         // migration lists, because that file belongs to the user.
         rebuild_constraint_file(
-            &constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
-            SUBAGENT_GUIDANCE,
-        )?;
-        rebuild_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
         )?;
-        let root_instructions = SUBAGENT_GUIDANCE.to_string();
         let collaboration_hint = ROOT_AGENT_COLLABORATION_USAGE_HINT.to_string();
         let registration_roles = runtime_registration_roles(
             &runtime_roles,
@@ -518,22 +525,17 @@ fn apply_isolated_runtime_router_config(
             fastctx_instructions.as_deref(),
             remote_compaction_models.as_ref(),
         )?;
-        (
-            Some(root_instructions),
-            Some(collaboration_hint),
-            runtime_agents,
-        )
+        (Some(collaboration_hint), runtime_agents)
     } else {
-        (None, None, Vec::new())
+        (None, Vec::new())
     };
     apply_isolated_prompt_sources(
         &mut effective_document,
-        root_instructions.as_deref(),
         fastctx_instructions.as_deref(),
         collaboration_hint.as_deref(),
     )?;
 
-    let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some();
+    let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some() || scope_guard;
     let original_hooks = if runtime_hooks_enabled {
         read_optional(&hooks_path)?
     } else {
@@ -550,6 +552,9 @@ fn apply_isolated_runtime_router_config(
     let fastctx_hook_commands = (fastctx_namespace.is_some() && !subagent_optimization)
         .then(|| crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT))
         .transpose()?;
+    let scope_guard_hook_commands = scope_guard
+        .then(|| crate::subagent_gate::hook_commands_for(crate::scope_guard::HOOK_ARGUMENT))
+        .transpose()?;
     let (updated_hooks, hook_trust_entries) = if runtime_hooks_enabled {
         let RuntimeHooksFile {
             contents,
@@ -560,6 +565,7 @@ fn apply_isolated_runtime_router_config(
             subagent_hook_commands.as_ref(),
             fastctx_hook_commands.as_ref(),
             combined_hook_commands.as_ref(),
+            scope_guard_hook_commands.as_ref(),
         )?;
         (Some(contents), trust_entries)
     } else {
@@ -585,11 +591,11 @@ fn apply_isolated_runtime_router_config(
     )?;
     let runtime_config_overrides = build_isolated_runtime_overrides(
         &effective_document,
-        root_instructions.as_deref(),
         &runtime_agents,
         fastctx_namespace,
         local_router.map(|_| local_router::ROUTER_PROVIDER_ID),
         &hook_trust_entries,
+        scope_guard,
         stream_max_retries,
     )?;
 
@@ -722,6 +728,7 @@ fn apply_isolated_test_runtime_config(
             subagent_model,
             subagent_reasoning_effort,
             subagent_roles,
+            scope_guard: false,
             marker,
             backup_root,
         },
@@ -973,7 +980,6 @@ fn runtime_agent_hashes(registrations: &[RuntimeAgentRegistration]) -> BTreeMap<
 
 fn apply_isolated_prompt_sources(
     document: &mut DocumentMut,
-    root_instructions: Option<&str>,
     fastctx_instructions: Option<&str>,
     collaboration_hint: Option<&str>,
 ) -> Result<()> {
@@ -995,15 +1001,6 @@ fn apply_isolated_prompt_sources(
             "developer_instructions",
         )?;
     }
-    if let Some(instructions) = root_instructions {
-        append_table_constraint_text(
-            document.as_table_mut(),
-            "developer_instructions",
-            instructions,
-            "developer_instructions",
-        )?;
-    }
-
     let Some(multi_agent) = document
         .get_mut("features")
         .and_then(Item::as_table_like_mut)
@@ -1980,7 +1977,7 @@ fn persistent_codey_subagent_config_is_owned(doc: &DocumentMut) -> bool {
             multi_agent
                 .get("multi_agent_mode_hint_text")
                 .and_then(Item::as_str)
-                == Some(ROOT_AGENT_MULTI_AGENT_MODE_HINT)
+                .is_some_and(|hint| ROOT_AGENT_MULTI_AGENT_MODE_HINT_VERSIONS.contains(&hint))
                 || multi_agent
                     .get("root_agent_usage_hint_text")
                     .and_then(Item::as_str)
@@ -2180,6 +2177,7 @@ fn patch_config_with_fastctx(
             subagent_optimization,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            scope_guard: false,
             local_router: Some(test_runtime_router_endpoint()),
         },
     )
@@ -2205,6 +2203,7 @@ struct RouterPatchOptions<'a> {
     subagent_optimization: bool,
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
+    scope_guard: bool,
     local_router: Option<&'a RuntimeRouterEndpoint>,
 }
 
@@ -2220,6 +2219,7 @@ fn patch_config_with_fastctx_mode(
         subagent_optimization,
         subagent_model,
         subagent_reasoning_effort,
+        scope_guard,
         local_router,
     } = options;
     let mut doc = parse_document(existing)?;
@@ -2250,7 +2250,7 @@ fn patch_config_with_fastctx_mode(
             fastctx_namespace.as_deref(),
         )?;
     }
-    if fastctx_namespace.is_some() {
+    if fastctx_namespace.is_some() || scope_guard {
         // Hook definitions live in the runtime hooks.json built by
         // `build_runtime_hooks_file`; the TOML document only carries the
         // feature flag that `build_isolated_runtime_overrides` forwards.
@@ -2304,8 +2304,10 @@ fn enable_subagent_optimization(
     multi_agent["expose_spawn_agent_model_overrides"] = value(false);
     multi_agent["tool_namespace"] = value("agents");
     multi_agent["min_wait_timeout_ms"] = value(10_000);
-    multi_agent["default_wait_timeout_ms"] = value(30_000);
-    multi_agent["max_wait_timeout_ms"] = value(30_000);
+    // wait_agent returns as soon as a child finishes or the user sends input,
+    // so a longer ceiling only removes idle timeout round trips.
+    multi_agent["default_wait_timeout_ms"] = value(120_000);
+    multi_agent["max_wait_timeout_ms"] = value(120_000);
     let existing_root_usage_hint = multi_agent
         .get("root_agent_usage_hint_text")
         .map(|item| {
@@ -2405,12 +2407,28 @@ const FASTCTX_ROUTE_HOOKS: [CodeyHookSpec; 1] = [CodeyHookSpec {
     timeout_seconds: crate::fastctx_route_gate::HOOK_TIMEOUT_SECONDS,
 }];
 
+const SCOPE_GUARD_HOOKS: [CodeyHookSpec; 2] = [
+    CodeyHookSpec {
+        toml_event: "SessionStart",
+        event_key: "session_start",
+        matcher: Some(crate::scope_guard::SESSION_START_MATCHER),
+        timeout_seconds: crate::scope_guard::HOOK_TIMEOUT_SECONDS,
+    },
+    CodeyHookSpec {
+        toml_event: "SubagentStart",
+        event_key: "subagent_start",
+        matcher: None,
+        timeout_seconds: crate::scope_guard::HOOK_TIMEOUT_SECONDS,
+    },
+];
+
 fn build_runtime_hooks_file(
     existing: Option<&[u8]>,
     hooks_path: &Path,
     subagent_commands: Option<&crate::subagent_gate::HookCommands>,
     fastctx_commands: Option<&crate::subagent_gate::HookCommands>,
     combined_commands: Option<&crate::subagent_gate::HookCommands>,
+    scope_guard_commands: Option<&crate::subagent_gate::HookCommands>,
 ) -> Result<RuntimeHooksFile> {
     let mut root = match existing {
         Some(existing) => serde_json::from_slice::<serde_json::Value>(existing)
@@ -2436,7 +2454,7 @@ fn build_runtime_hooks_file(
         }
     }
 
-    let mut hook_plans = Vec::with_capacity(3);
+    let mut hook_plans = Vec::with_capacity(4);
     if let Some(subagent_commands) = subagent_commands {
         if let Some(combined_commands) = combined_commands {
             hook_plans.push((&SUBAGENT_GATE_HOOKS[..1], combined_commands));
@@ -2447,6 +2465,9 @@ fn build_runtime_hooks_file(
     }
     if let Some(fastctx_commands) = fastctx_commands {
         hook_plans.push((&FASTCTX_ROUTE_HOOKS[..], fastctx_commands));
+    }
+    if let Some(scope_guard_commands) = scope_guard_commands {
+        hook_plans.push((&SCOPE_GUARD_HOOKS[..], scope_guard_commands));
     }
     let mut trust_entries =
         Vec::with_capacity(hook_plans.iter().map(|(specs, _)| specs.len()).sum());
@@ -2525,11 +2546,11 @@ fn json_hook_group_is_codey_owned(group: &serde_json::Value) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn build_isolated_runtime_overrides(
     effective: &DocumentMut,
-    root_instructions: Option<&str>,
     runtime_agents: &[RuntimeAgentRegistration],
     fastctx_namespace: Option<&str>,
     provider_id: Option<&str>,
     hook_trust_entries: &[RuntimeHookTrustEntry],
+    scope_guard: bool,
     stream_max_retries: u32,
 ) -> Result<Vec<String>> {
     let mut overrides = Vec::new();
@@ -2698,7 +2719,9 @@ fn build_isolated_runtime_overrides(
         )?;
     }
 
-    if fastctx_namespace.is_some() || root_instructions.is_some() {
+    // Keep the cleaned value authoritative over historical Codey guidance
+    // that may still sit in the user's `developer_instructions`.
+    if fastctx_namespace.is_some() || !runtime_agents.is_empty() {
         push_document_override(
             &mut overrides,
             effective,
@@ -2813,7 +2836,7 @@ fn build_isolated_runtime_overrides(
             usize::from(fastctx_namespace.is_some())
         } else {
             SUBAGENT_GATE_HOOKS.len()
-        };
+        } + usize::from(scope_guard) * SCOPE_GUARD_HOOKS.len();
         anyhow::ensure!(
             hook_trust_entries.len() == expected_hook_count,
             "Codey Hook 信任项不完整"
@@ -2985,6 +3008,7 @@ fn enable_hooks_feature(doc: &mut DocumentMut) -> Result<()> {
 fn hook_command_is_codey_owned(command: &str) -> bool {
     command.contains(crate::subagent_gate::HOOK_ARGUMENT)
         || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+        || command.contains(crate::scope_guard::HOOK_ARGUMENT)
 }
 
 /// Releases before the runtime `hooks.json` carried their hook definitions in

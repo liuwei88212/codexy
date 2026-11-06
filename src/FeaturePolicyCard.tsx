@@ -519,7 +519,7 @@ function FeaturePolicyCardComponent({
               </span>
             </Tooltip>
           </div>
-          <p>客户端与 app-server 经此代理访问网络，重启 Codex 后生效；本地路由与额度查询不受影响。</p>
+          <p>客户端与 app-server 经此代理访问网络，保存后重启 Codex 生效。代理不可达时仍可打开控制台修改。</p>
         </div>
         <div className={`feature-card launch-proxy-card ${launchProxy.trim() ? "active" : ""}`}>
           <div className="feature-card-body launch-proxy-row">
@@ -544,7 +544,6 @@ function FeaturePolicyCardComponent({
                   : undefined
               }
               value={launchProxy}
-              disabled={isBusy}
               placeholder="留空不走代理，例如 http://127.0.0.1:7890"
               rightSection={
                 launchProxy ? (
@@ -705,6 +704,29 @@ function FeaturePolicyCardComponent({
                     : config.fastContextTools
                       ? "下次启动加载 Codey 内置 FastCtx 文件工具"
                       : "保持 Codex 默认文件工具，不加载额外 MCP"}
+                </small>
+              </div>
+            </div>
+
+            <div
+              className={`feature-card ${config.scopeGuard ? "active" : ""}`}
+            >
+              <div className="feature-card-header">
+                <strong>防御性编程控制</strong>
+                <Switch
+                  checked={config.scopeGuard}
+                  disabled={isBusy}
+                  onCheckedChange={(checked) =>
+                    onConfigChange({ ...config, scopeGuard: checked })
+                  }
+                  aria-label="防御性编程控制"
+                />
+              </div>
+              <div className="feature-card-body">
+                <small>
+                  {config.scopeGuard
+                    ? "新会话和压缩后向代理注入防护尺度规则，减少不必要的兼容层、兜底和重复检查"
+                    : "不注入额外规则，保持 Codex 默认行为"}
                 </small>
               </div>
             </div>

@@ -1,7 +1,7 @@
 use super::*;
 use crate::codey_plugins::lifecycle::LifecycleRequest;
 
-/// 追加发送只能由已收到的响应触发。连接失败、发送中断和下游已输出均不能重放。
+/// 响应修复共享一次预算；响应头之前的网络故障由独立的可取消等待重试处理。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SendState {
     Ready,
@@ -14,6 +14,7 @@ enum SendState {
 pub(super) enum RetryReason {
     Plugin,
     ReasoningText,
+    EncryptedReasoning,
 }
 
 impl RetryReason {
@@ -21,11 +22,12 @@ impl RetryReason {
         match self {
             Self::Plugin => "plugin_request_retry",
             Self::ReasoningText => "reasoning_text_placeholder_retry",
+            Self::EncryptedReasoning => "rejected_encrypted_reasoning_retry",
         }
     }
 }
 
-/// 一次请求最多发送两次；插件与 reasoning 修复使用同一份预算。
+/// 插件与 reasoning 修复共享一次追加发送预算，网络等待不消耗这份预算。
 pub(super) struct AttemptBudget {
     state: SendState,
     retry_reason: Option<RetryReason>,
@@ -78,6 +80,14 @@ impl AttemptBudget {
 
     pub(super) fn retry_reason(&self) -> Option<RetryReason> {
         self.retry_reason
+    }
+
+    fn reserve_network_retry(&mut self) -> bool {
+        if self.state != SendState::Failed {
+            return false;
+        }
+        self.state = SendState::Ready;
+        true
     }
 }
 
@@ -157,7 +167,15 @@ impl HttpExecution<'_> {
             && !self.resolved.route.official_account
     }
 
-    /// 只在明确的 400 reasoning 缺失响应后构造修复请求。无法取得工作集预算时保留原错误。
+    /// 官方账号同样可能拒绝历史中的 reasoning 密文；只在正文确实带密文时保留重发副本。
+    fn encrypted_reasoning_retry_allowed(&self, encoded: &[u8]) -> bool {
+        self.bridge == ProtocolBridge::NativeResponses
+            && (!self.compacting || self.native_compaction)
+            && memchr::memmem::find(encoded, b"\"encrypted_content\"").is_some()
+    }
+
+    /// 只在明确的 400 reasoning 缺失或密文校验失败响应后构造修复请求。
+    /// 无法取得工作集预算时保留原错误。
     fn prepare_reasoning_retry(
         &self,
         error_body: &[u8],
@@ -165,10 +183,24 @@ impl HttpExecution<'_> {
         summaries: &[Option<String>],
         admission: &mut Option<OwnedSemaphorePermit>,
         probe: Option<&RouteRequestLogProbe>,
-    ) -> Result<Option<Bytes>> {
-        let Some(encoded) = encoded.filter(|_| requires_reasoning_text_fallback(error_body)) else {
+    ) -> Result<Option<(Bytes, RetryReason)>> {
+        let Some(encoded) = encoded else {
             return Ok(None);
         };
+        let rejected_item = (self.bridge == ProtocolBridge::NativeResponses)
+            .then(|| http_error_rejected_reasoning_item(error_body))
+            .flatten();
+        let reason = if rejected_item.is_some() {
+            RetryReason::EncryptedReasoning
+        } else if self.reasoning_retry_allowed() && requires_reasoning_text_fallback(error_body) {
+            RetryReason::ReasoningText
+        } else {
+            return Ok(None);
+        };
+        if let Some(id) = rejected_item.as_deref() {
+            // 即使本次无法重发，后续请求也应避开这一项。
+            record_rejected_reasoning_item(id);
+        }
         if grow_request_body_budget(admission, &self.server.request_body_budget, encoded.len())
             .is_err()
         {
@@ -176,7 +208,11 @@ impl HttpExecution<'_> {
         }
         let mut body =
             serde_json::from_slice::<Value>(encoded).context("解析 reasoning 回退请求失败")?;
-        if !fill_missing_reasoning_text_with_chat_summaries(&mut body, summaries) {
+        let repaired = match reason {
+            RetryReason::EncryptedReasoning => strip_rejected_reasoning_items(&mut body),
+            _ => fill_missing_reasoning_text_with_chat_summaries(&mut body, summaries),
+        };
+        if !repaired {
             return Ok(None);
         }
         let encoded =
@@ -187,7 +223,7 @@ impl HttpExecution<'_> {
                 Some(encoded.len() as u64),
             ));
         }
-        Ok(Some(encoded.into()))
+        Ok(Some((encoded.into(), reason)))
     }
 
     /// 执行阶段只负责发送和有限修复，不向成功正文写入任何协议事件。
@@ -204,7 +240,9 @@ impl HttpExecution<'_> {
             body: mut encoded,
             mut admission,
         } = request;
-        let mut retryable_encoded = self.reasoning_retry_allowed().then(|| encoded.clone());
+        let mut retryable_encoded = (self.reasoning_retry_allowed()
+            || self.encrypted_reasoning_retry_allowed(&encoded))
+        .then(|| encoded.clone());
         let mut attempts = AttemptBudget {
             transport: if self.upstream_stream_requested {
                 UpstreamTransport::HttpSse
@@ -214,8 +252,17 @@ impl HttpExecution<'_> {
             ..Default::default()
         };
         let header_timeout = self.response_header_timeout();
+        // 只保留尚未输出的普通流式请求。压缩及已有响应的请求继续遵循原来的失败契约。
+        let retry_network = self.upstream_stream_requested
+            && self.request_kind == ResponsesRequestKind::Create
+            && !self.compacting
+            && !downstream.event_stream_started();
         loop {
-            let retained_after_upload = if retryable_encoded.is_some() || lifecycle.is_active() {
+            let network_body = retry_network.then(|| encoded.clone());
+            let retained_after_upload = if retry_network
+                || retryable_encoded.is_some()
+                || lifecycle.is_active()
+            {
                 encoded.len()
             } else {
                 0
@@ -233,6 +280,23 @@ impl HttpExecution<'_> {
                 self.resolved.route.plugin_transport.as_ref(),
             )
             .await?;
+            let network_failed = match &result {
+                Ok(Err(error)) => error.is_connect() || error.is_timeout() || error.is_request(),
+                // 已上传请求的响应头期限不是建连故障，重放可能重复执行上游任务。
+                Err(_) => false,
+                _ => false,
+            };
+            if retry_network && network_failed && attempts.reserve_network_retry() {
+                if let Some(probe) = downstream.request_log_probe() {
+                    probe.mark_fallback("upstream_network_retry");
+                }
+                // 开始 SSE 保活后沿用下游取消监听；代理恢复前不消耗客户端的五次重连预算。
+                downstream.start_event_stream().await?;
+                await_upstream(downstream, tokio::time::sleep(Duration::from_secs(60))).await?;
+                encoded = network_body.expect("network retry retains the request body");
+                continue;
+            }
+            drop(network_body);
             let Some(response) = self.finish_send(downstream, result, header_timeout).await? else {
                 return Ok(None);
             };
@@ -276,7 +340,7 @@ impl HttpExecution<'_> {
             };
             if can_repair_reasoning
                 && attempts.can_retry(downstream.event_stream_started())
-                && let Some(retry) = self.prepare_reasoning_retry(
+                && let Some((retry, reason)) = self.prepare_reasoning_retry(
                     &body,
                     retryable_encoded.as_deref(),
                     summaries,
@@ -285,10 +349,7 @@ impl HttpExecution<'_> {
                 )?
             {
                 // 预读期间可能发生取消或下游输出；发送许可在真正重发前再次检查。
-                if attempts.reserve_retry(
-                    RetryReason::ReasoningText,
-                    downstream.event_stream_started(),
-                ) {
+                if attempts.reserve_retry(reason, downstream.event_stream_started()) {
                     if let Some(probe) = probe.as_ref() {
                         probe.finish_upstream_attempt(
                             crate::route_request_log::AttemptOutcome::Superseded,

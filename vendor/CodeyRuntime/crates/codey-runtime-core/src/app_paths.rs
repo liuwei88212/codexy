@@ -313,18 +313,24 @@ pub fn resolve_codex_app_dir_with_saved_checked(
             .iter()
             .map(|package| normalize_codex_app_path_checked(&package.install_location))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (mut roots, mut diagnostics) = standalone_registry_roots();
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let local = PathBuf::from(local);
-            roots.extend([
-                local.join("Programs/Codex"),
-                local.join("OpenAI/Codex/bin"),
-                local.join("OpenAI/Codex"),
-                local.join("Programs/OpenAI/Codex"),
-            ]);
-        }
+        let (roots, mut diagnostics) = standalone_registry_roots();
         required.extend(collect_automatic_app_roots(roots)?);
         let mut optional = Vec::new();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            // 常见目录也可能属于 CLI，必须通过桌面身份校验才能参与自动选择。
+            add_optional_discovery_source(
+                &mut optional,
+                &mut diagnostics,
+                "常见安装目录",
+                collect_automatic_app_roots(vec![
+                    local.join("Programs/Codex"),
+                    local.join("OpenAI/Codex/bin"),
+                    local.join("OpenAI/Codex"),
+                    local.join("Programs/OpenAI/Codex"),
+                ]),
+            );
+        }
         add_optional_discovery_source(
             &mut optional,
             &mut diagnostics,
@@ -1807,6 +1813,21 @@ mod tests {
             latest_appx_install_location_from_output("C:/Store/stable\nC:/Store/stable"),
             Some("C:/Store/stable".into())
         );
+    }
+
+    #[test]
+    fn heuristic_cli_directory_does_not_block_a_registered_desktop() {
+        let temp = tempfile::tempdir().unwrap();
+        let desktop = temp.path().join("registered/app");
+        write_windows_client(&desktop);
+        let cli = temp.path().join("OpenAI/Codex/bin");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::write(cli.join("codex.exe"), b"Codex CLI").unwrap();
+        let heuristic = collect_automatic_app_roots(vec![cli]).unwrap();
+        let candidates = std::iter::once((desktop.clone(), true))
+            .chain(heuristic.into_iter().map(|path| (path, false)));
+        let accepted = validate_automatic_app_candidates(candidates, validate_codex_app_dir).unwrap();
+        assert_eq!(accepted, vec![std::fs::canonicalize(desktop).unwrap()]);
     }
 
     #[test]

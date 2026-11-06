@@ -3,6 +3,42 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::config::ProviderProfile;
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "requires the current user's registered Codex Store installation"]
+async fn installed_store_codex_recovers_and_saves_a_removed_version_path() {
+    let current = crate::launcher::resolve_configured_codex_app_dir(&CodeyConfig::default())
+        .await
+        .unwrap();
+    let package_dir = current
+        .ancestors()
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OpenAI.Codex_"))
+        })
+        .expect("Codex Store 安装");
+    let mut parts: Vec<_> = package_dir.file_name().unwrap().to_str().unwrap().split('_').collect();
+    parts[1] = "0.0.0.0";
+    let old = package_dir.parent().unwrap().join(parts.join("_")).join("app");
+    assert!(!old.exists());
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(CodeyConfig {
+            codex_app_path: old.to_string_lossy().into_owned(),
+            ..CodeyConfig::default()
+        }),
+        ..AppState::default()
+    });
+    ensure_windows_codex_app_path(&state).await.unwrap();
+    let saved = state.store.load().unwrap();
+    assert_eq!(std::fs::canonicalize(&saved.codex_app_path).unwrap(), current);
+    assert_eq!(saved.settings_revision, 1);
+    ensure_windows_codex_app_path(&state).await.unwrap();
+    assert_eq!(state.store.load().unwrap().settings_revision, 1);
+    println!("Resolved and saved Codex path {}", saved.codex_app_path);
+}
+
 #[tokio::test]
 async fn official_concurrency_command_rejects_invalid_values_before_saving() {
     let directory = tempfile::tempdir().unwrap();

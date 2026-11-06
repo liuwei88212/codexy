@@ -14,31 +14,37 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::AppState;
 use crate::config::ConfigStore;
+use crate::system_proxy_client::SystemProxyClient;
 
 const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_UPDATE_MANIFEST_BYTES: usize = 1024 * 1024;
 static DEVICE_IDENTITY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn device_http_client() -> Result<&'static reqwest::Client, String> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    CLIENT
+fn device_http_client_builder() -> reqwest::ClientBuilder {
+    // 注册请求体和检查、上报请求头都包含密钥，禁止转发到重定向目标。
+    let builder = reqwest::Client::builder()
+        .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("设备身份请求不允许重定向")
+        }));
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
+}
+
+/// 返回访问 `url` 的设备身份客户端，随系统代理变化重建。
+async fn device_http_client(url: &str) -> Result<reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<SystemProxyClient, String>> = OnceLock::new();
+    let client = CLIENT
         .get_or_init(|| {
-            // 注册请求体和检查、上报请求头都包含密钥，禁止转发到重定向目标。
-            let builder = reqwest::Client::builder()
-                .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    attempt.error("设备身份请求不允许重定向")
-                }));
-            #[cfg(test)]
-            let builder = builder.no_proxy();
-            builder
-                .build()
-                .map_err(|error| format!("创建设备更新客户端失败：{error}"))
+            SystemProxyClient::new_blocking(device_http_client_builder)
+                .map_err(|error| format!("创建设备更新客户端失败：{error:#}"))
         })
         .as_ref()
-        .map_err(Clone::clone)
+        .map_err(Clone::clone)?;
+    Ok(client.current(url).await)
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +84,23 @@ struct UpdateManifestAsset {
     url: String,
     sha256: String,
     size: u64,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    body: Option<String>,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -559,9 +582,11 @@ async fn load_or_register_device(
         "osName": current_os_name(),
         "osVersion": current_os_version(),
     });
-    let response = device_http_client()
+    let register_url = format!("{base_url}/api/devices/register");
+    let response = device_http_client(&register_url)
+        .await
         .map_err(|error| device_identity_failure("client", error))?
-        .post(format!("{base_url}/api/devices/register"))
+        .post(register_url)
         .json(&body)
         .timeout(Duration::from_secs(10))
         .send()
@@ -625,9 +650,9 @@ async fn fetch_release_admin_update(
         query.push(("osVersion", os_version));
     }
     let client = if identity.is_some() {
-        device_http_client()?
+        device_http_client(endpoint.as_str()).await?
     } else {
-        &state.http_client
+        state.http_client.current(endpoint.as_str()).await
     };
     let mut request = client.get(endpoint).query(&query);
     if let Some(identity) = &identity {
@@ -773,7 +798,7 @@ async fn download_update_candidate_with_mode(
         .as_ref()
         .ok_or_else(|| "没有适用于当前系统的可安装更新包".to_string())?;
     let file_path = match download_update_asset(
-        &state.http_client,
+        &state.http_client.current(&asset.url).await,
         &state.store,
         &candidate.check.latest_version,
         asset,
@@ -833,7 +858,8 @@ async fn report_publish_event(
         "errorMessage": error_message,
     });
     let mut last_error = String::from("上报更新状态失败");
-    let client = device_http_client()?;
+    let client =
+        device_http_client(&format!("{base_url}/api/publishes/{publish_id}/report")).await?;
     for attempt in 0..3 {
         match client
             .post(format!("{base_url}/api/publishes/{publish_id}/report"))
@@ -1011,6 +1037,8 @@ async fn fetch_configured_update_manifest(
 
     let response = state
         .http_client
+        .current(url.as_str())
+        .await
         .get(url)
         .header(
             USER_AGENT,
@@ -1033,9 +1061,76 @@ async fn fetch_configured_update_manifest(
     )
     .await
     .map_err(|error| format!("读取更新清单失败：{error:#}"))?;
+    if manifest_url == crate::config::GITHUB_RELEASES_URL {
+        return github_release_manifest(&body, state.config.read().await.codey_update_policy);
+    }
     let manifest = serde_json::from_slice::<UpdateManifest>(&body)
         .map_err(|error| format!("更新清单格式无效：{error}"))?;
     Ok(manifest)
+}
+
+fn github_release_manifest(
+    body: &[u8],
+    policy: crate::config::CodeyUpdatePolicy,
+) -> Result<UpdateManifest, String> {
+    let releases: Vec<GithubRelease> = serde_json::from_slice(body)
+        .map_err(|error| format!("GitHub 发布信息格式无效：{error}"))?;
+    let (version, release) = releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let version = Version::parse(release.tag_name.strip_prefix('v')?).ok()?;
+            let experimental = release.prerelease || !version.pre.is_empty();
+            if experimental && policy != crate::config::CodeyUpdatePolicy::Experimental {
+                return None;
+            }
+            Some((version, release))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .ok_or_else(|| "项目尚未发布符合更新策略的版本".to_string())?;
+    let mut assets = Vec::new();
+    for asset in release.assets {
+        let Some((platform, arch, package_type, _)) = [
+            ("windows", "x64", "nsis", "windows-x64-setup.exe"),
+            ("windows", "arm64", "nsis", "windows-arm64-setup.exe"),
+            ("macos", "arm64", "app-zip", "macos-arm64-unsigned.zip"),
+            ("macos", "x64", "app-zip", "macos-x64-unsigned.zip"),
+        ]
+        .into_iter()
+        .find(|(_, _, _, suffix)| asset.name == format!("Codey-{version}-{suffix}"))
+        else {
+            continue;
+        };
+        // 使用 GitHub 为上传产物计算的摘要，继续沿用下载大小和 SHA-256 校验。
+        let sha256 = asset
+            .digest
+            .as_deref()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .ok_or_else(|| format!("GitHub 安装包缺少 SHA-256：{}", asset.name))?;
+        let expected_url = format!(
+            "https://github.com/liuwei88212/codexy/releases/download/{}/{}",
+            release.tag_name, asset.name
+        );
+        if asset.browser_download_url != expected_url {
+            return Err("GitHub 安装包地址不属于当前项目和发布版本".to_string());
+        }
+        assets.push(UpdateManifestAsset {
+            platform: platform.into(),
+            arch: arch.into(),
+            package_type: package_type.into(),
+            file_name: asset.name,
+            url: asset.browser_download_url,
+            sha256: sha256.into(),
+            size: asset.size,
+        });
+    }
+    Ok(UpdateManifest {
+        schema_version: 1,
+        version: version.to_string(),
+        tag: release.tag_name,
+        release_notes: release.body,
+        assets,
+    })
 }
 
 pub(super) fn assess_update_manifest(
@@ -1589,6 +1684,70 @@ fn spawn_update_installer(_update_path: &Path, _asset: &UpdateAssetInfo) -> Resu
 mod tests {
     use super::*;
 
+    fn github_release_fixture(version: &str, prerelease: bool) -> serde_json::Value {
+        let name = format!("Codey-{version}-windows-x64-setup.exe");
+        serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "draft": false,
+            "prerelease": prerelease,
+            "body": "发布说明",
+            "assets": [{
+                "name": name,
+                "browser_download_url": format!("https://github.com/liuwei88212/codexy/releases/download/v{version}/{name}"),
+                "size": 123,
+                "digest": format!("sha256:{}", "a".repeat(64))
+            }]
+        })
+    }
+
+    #[test]
+    fn github_releases_respect_policy_version_order_and_drafts() {
+        use crate::config::CodeyUpdatePolicy;
+        let mut draft = github_release_fixture("9.0.0", false);
+        draft["draft"] = true.into();
+        let body = serde_json::to_vec(&vec![
+            github_release_fixture("2.0.0-beta.1", true),
+            github_release_fixture("1.2.0", false),
+            github_release_fixture("1.3.0", false),
+            draft,
+        ]).unwrap();
+        let stable = github_release_manifest(&body, CodeyUpdatePolicy::Stable).unwrap();
+        assert_eq!(stable.version, "1.3.0");
+        assert_eq!(stable.release_notes.as_deref(), Some("发布说明"));
+        assert!(assess_update_manifest("1.0.0", &stable).unwrap().update_available);
+        let experimental = github_release_manifest(&body, CodeyUpdatePolicy::Experimental).unwrap();
+        assert_eq!(experimental.version, "2.0.0-beta.1");
+    }
+
+    #[test]
+    fn github_releases_require_project_urls_and_valid_digests() {
+        use crate::config::CodeyUpdatePolicy;
+        let mut release = github_release_fixture("1.3.0", false);
+        release["assets"][0]["digest"] = serde_json::Value::Null;
+        let parse = |release| github_release_manifest(
+            &serde_json::to_vec(&vec![release]).unwrap(), CodeyUpdatePolicy::Stable
+        );
+        assert!(parse(release).unwrap_err().contains("SHA-256"));
+        let mut release = github_release_fixture("1.3.0", false);
+        release["assets"][0]["browser_download_url"] = "https://example.com/setup.exe".into();
+        assert!(parse(release).unwrap_err().contains("不属于当前项目"));
+        let mut release = github_release_fixture("1.3.0", false);
+        release["assets"][0]["digest"] = "sha256:invalid".into();
+        assert!(assess_update_manifest("1.0.0", &parse(release).unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires access to the public GitHub Releases API"]
+    async fn github_releases_live_update_check() {
+        let state = AppState::default();
+        state.config.write().await.codey_update_policy = crate::config::CodeyUpdatePolicy::Stable;
+        let manifest = fetch_configured_update_manifest(&state, crate::config::GITHUB_RELEASES_URL)
+            .await.unwrap();
+        let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest).unwrap();
+        assert!(check.selected_asset.is_some());
+        println!("GitHub release {}", check.latest_version);
+    }
+
     #[tokio::test]
     async fn device_requests_reject_redirects_but_public_requests_still_follow_them() {
         let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1625,7 +1784,8 @@ mod tests {
         });
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             for method in [reqwest::Method::GET, reqwest::Method::POST] {
-                let error = device_http_client()
+                let error = device_http_client(&source_url)
+                    .await
                     .unwrap()
                     .request(method, &source_url)
                     .header("x-device-key", "test-install-key")
@@ -1638,7 +1798,9 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let state = AppState {
                 store: ConfigStore::new(directory.path().join("config.json")),
-                http_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                http_client: crate::system_proxy_client::SystemProxyClient::fixed(
+                    reqwest::Client::builder().no_proxy().build().unwrap(),
+                ),
                 ..AppState::default()
             };
             TEST_DEVICE_VERSIONS
@@ -1679,6 +1841,7 @@ mod tests {
             assert!(
                 state
                     .http_client
+                    .cached()
                     .get(&source_url)
                     .send()
                     .await
@@ -2023,7 +2186,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState {
             store: ConfigStore::new(directory.path().join("config.json")),
-            http_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            http_client: crate::system_proxy_client::SystemProxyClient::fixed(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
             ..AppState::default()
         };
         // AppState::default() 会读取真实用户配置，更新策略必须显式固定。

@@ -74,6 +74,52 @@ test("renamed minified variables still match the semantic anchors exactly once",
   assert.equal(h.patch(renamed), patched);
 });
 
+test("Codex 26.1021 composer adapter chunk passes a derived collaboration mode", () => {
+  // The submission now receives J=H!=null&&cr&&!In?null:K while the quota
+  // check still reads K.settings.model, so the mode binding may differ.
+  const derived = fixture
+    .replace("const submission=", "const activeMode=zt;const submission=")
+    .replace("activeCollaborationMode:zt", "activeCollaborationMode:activeMode");
+  const h = harness({ allowsLocalSend: ({ model }) => model === "third-party" });
+  const patched = h.patch(derived, "app://-/assets/codex-composer-adapter-8f303ad0f240.js");
+  assert.equal(patched.split(marker).length - 1, 1);
+  vm.runInContext(patched, h.context);
+  assert.equal(h.context.render("third-party", "local", true, false), false);
+  assert.equal(h.context.render("gpt-official", "local", true, false), true);
+  assert.deepEqual(h.failures, []);
+});
+
+test("Codex 26.1021 workspace hard block follows the same local third-party gate", () => {
+  // Team workspaces without credits add a per-host hard block next to the
+  // quota term; it previously kept third-party models disabled.
+  const hardBlock = fixture
+    .replace("function render(model,host,quotaBlocked,otherDisabled){", "function render(model,host,quotaBlocked,otherDisabled,hardBlocked=quotaBlocked){")
+    .replace(",yn=null;", ",HB=(blocked,id)=>blocked,Rn=HB(hardBlocked,bt),yn=null;")
+    .replace("||gn||vn,Qn", "||gn||Rn||vn,Qn");
+  const hardMarker = "/*codey-local-hard-block-gate*/";
+  const helper = { allowsLocalSend: ({ hostId, model }) => hostId === "local" && model === "third-party" };
+  const h = harness(helper);
+  const patched = h.patch(hardBlock, "app://-/assets/codex-composer-adapter-8f303ad0f240.js");
+  assert.equal(patched.split(marker).length - 1, 1);
+  assert.equal(patched.split(hardMarker).length - 1, 1);
+  assert.equal(h.patch(patched), patched);
+  vm.runInContext(patched, h.context);
+  const render = h.context.render;
+  assert.equal(render("third-party", "local", true, false), false);
+  assert.equal(render("third-party", "local", false, false, true), false);
+  assert.equal(render("gpt-official", "local", false, false, true), true);
+  assert.equal(render("third-party", "remote", false, false, true), true);
+  assert.equal(render("third-party", "local", false, true, true), true);
+  assert.equal(render("gpt-official", "local", false, false, false), false);
+  assert.deepEqual(h.failures, []);
+
+  for (const unavailable of [undefined, { allowsLocalSend() { throw Error("unavailable"); } }]) {
+    const fallback = harness(unavailable);
+    vm.runInContext(fallback.patch(hardBlock), fallback.context);
+    assert.equal(fallback.context.render("third-party", "local", false, false, true), true);
+  }
+});
+
 test("duplicate or drifted quota gates are left unchanged and reported", () => {
   for (const [source, count] of [[fixture + fixture, 2], [fixture.replace("resolvedHostId:bt", "resolvedHostId:anotherHost"), 0], [fixture.replace("||vn,Qn", "||anotherQuota,Qn"), 0]]) {
     const h = harness();

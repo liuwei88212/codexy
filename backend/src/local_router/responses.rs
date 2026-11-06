@@ -737,7 +737,7 @@ impl RouterServer {
         if let Some(probe) = &probe {
             probe.set_upstream_request_headers(&format_upstream_headers(&headers));
         }
-        let upstream_client = match self.upstream_client(&route) {
+        let upstream_client = match self.upstream_client(&route).await {
             Ok(client) => client,
             Err(message) => {
                 mark_error(502, "route_configuration_error");
@@ -978,11 +978,12 @@ impl RouterServer {
             }) {
                 // SIWC 直连平面：令牌来自账号的 SIWC 槽位，不接受下游自带的
                 // Codex 令牌；backend-api 专属头一律剥掉。
+                let default_client = self.default_client(route).await;
                 let siwc_auth = resolve_siwc_upstream_auth(
                     siwc_path,
                     account_id,
                     &self.siwc_auth_cache,
-                    &self.client,
+                    &default_client,
                     &self.proxied_clients,
                 )
                 .await
@@ -1302,6 +1303,10 @@ impl RouterServer {
                     downstream.adapted_history.clear_pending();
                     downstream.native_history.clear_pending();
                     if let Err(error) = result {
+                        if error.is::<CompactionInterrupted>() {
+                            downstream.finish_compaction_interrupt().await?;
+                            continue;
+                        }
                         if error.is::<DownstreamClosed>() {
                             // Reading a Close queues tungstenite's close reply.
                             // Drop the proxy future/upstream before flushing it.
@@ -1338,8 +1343,13 @@ impl RouterServer {
                 }
                 WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
                 WebSocketMessage::Pong(_) => {}
-                WebSocketMessage::Close(frame) => {
-                    downstream.close(frame).await?;
+                WebSocketMessage::Close(_) => {
+                    // Reading a Close already queued tungstenite's reply; sending
+                    // another Close fails with SendAfterClosing. Flush the reply.
+                    downstream.upstream.take();
+                    let _ =
+                        tokio::time::timeout(DOWNSTREAM_WRITE_TIMEOUT, downstream.socket.flush())
+                            .await;
                     break;
                 }
                 WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
@@ -1976,6 +1986,15 @@ impl RouterServer {
         if bridge != ProtocolBridge::NativeResponses
             && let Err(error) = downstream.prepare_adapted_response_context(&mut body)
         {
+            if error.is::<MissingResponseHistory>() {
+                return write_missing_response_history(
+                    downstream,
+                    &error,
+                    &resolved.route,
+                    "restore_adapted_response_history",
+                )
+                .await;
+            }
             downstream
                 .write_error(
                     413,
@@ -1991,6 +2010,15 @@ impl RouterServer {
         if restoring_adapted_history {
             match downstream.prepare_adapted_response_context(&mut body) {
                 Ok(true) => {}
+                Err(error) if error.is::<MissingResponseHistory>() => {
+                    return write_missing_response_history(
+                        downstream,
+                        &error,
+                        &resolved.route,
+                        "restore_adapted_response_history",
+                    )
+                    .await;
+                }
                 _ => {
                     return downstream
                         .write_error(
@@ -2300,9 +2328,14 @@ impl RouterServer {
                     UpstreamWebSocketAttempt::Completed => return Ok(()),
                     UpstreamWebSocketAttempt::UseHttp(reason) => reason,
                 };
-                if had_previous_response && responses_previous_response_id(&upstream_body).is_none()
+                if matches!(
+                    fallback_reason,
+                    "websocket_persisted_context_rejected"
+                        | "websocket_encrypted_reasoning_rejected"
+                ) || (had_previous_response
+                        && responses_previous_response_id(&upstream_body).is_none())
                 {
-                    // Reconnection may have expanded history before its handshake failed.
+                    // 重连可能已展开历史；同轮恢复也必须按恢复后的 HTTP 正文重新编码。
                     body_mutated = true;
                     encoded_body = None;
                 }
@@ -2323,6 +2356,16 @@ impl RouterServer {
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    if error.is::<MissingResponseHistory>() {
+                        // 此时尚未生成，或上游已明确拒绝且没有执行迹象。
+                        return write_missing_response_history(
+                            downstream,
+                            &error,
+                            &resolved.route,
+                            "restore_native_response_history",
+                        )
+                        .await;
+                    }
                     record_router_failure_nonblocking(
                         "local_router_context_not_recoverable",
                         "restore_native_response_history",
@@ -2483,7 +2526,7 @@ impl RouterServer {
         // 用 .header() 会追加重复值。只在 HTTP 请求上设置，上游 WebSocket 握手已在
         // 此前发起，不携带 content-type。
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let upstream_client = match self.upstream_client(&resolved.route) {
+        let upstream_client = match self.upstream_client(&resolved.route).await {
             Ok(client) => client,
             Err(message) => {
                 return downstream
@@ -2613,4 +2656,43 @@ pub(crate) fn format_upstream_response_headers(headers: &reqwest::header::Header
 
 fn is_sensitive_upstream_response_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
+}
+
+/// 发往上游前找不到续接历史。Codex 收到这个裸错误会丢弃响应链并重发完整输入。
+async fn write_missing_response_history<D>(
+    downstream: &mut D,
+    error: &anyhow::Error,
+    route: &RouteTarget,
+    operation: &'static str,
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
+    record_router_failure_nonblocking(
+        "local_router_previous_response_not_found",
+        operation,
+        error.to_string(),
+        json!({"requestId": current_router_request_id(), "routeId": route.provider_id}),
+    );
+    if !downstream.is_websocket() {
+        return downstream
+            .write_error(
+                400,
+                "previous_response_not_found",
+                error.to_string(),
+                Some(route),
+            )
+            .await;
+    }
+    downstream
+        .write_event(&json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": error.to_string(),
+            },
+        }))
+        .await
 }

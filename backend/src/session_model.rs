@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, target_os = "macos", test))]
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
 use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
@@ -117,6 +119,23 @@ fn confirmed_model(home: &Path, thread_id: &str) -> Result<Option<ConfirmedModel
     Ok(Some(record))
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+fn settings_write_lock(path: &Path) -> Result<Arc<Mutex<()>>> {
+    type WriteLocks = std::collections::HashMap<PathBuf, Weak<Mutex<()>>>;
+    static LOCKS: OnceLock<Mutex<WriteLocks>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("会话模型写入锁损坏"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_owned(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
 // 仅接收 app-server 已确认的设置通知，未发送消息的模型选择也能跨重启保留。
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn remember_settings(
@@ -141,10 +160,15 @@ pub(crate) fn remember_settings(
     let selected_at_ms = selected_at_ms
         .filter(|v| *v > 0 && *v <= now.saturating_add(300_000))
         .unwrap_or(now);
+    let store = home.join("codey-session-models");
+    // 同进程通知按会话排队，磁盘同步耗时不占用其他通知的跨进程锁等待额度。
+    let local_lock = settings_write_lock(&store.join(format!("{thread_id}.lock")))?;
+    let _local_guard = local_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("会话模型写入锁损坏"))?;
     if confirmed_model(&home, thread_id)?.is_some_and(|old| old.selected_at_ms > selected_at_ms) {
         return Ok(());
     }
-    let store = home.join("codey-session-models");
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     let builder = {
@@ -206,6 +230,15 @@ pub(crate) fn remember_settings(
 }
 
 pub(crate) fn read(home: &Path, thread_id: &str) -> Result<Value> {
+    read_saved(home, thread_id, true)
+}
+
+pub(crate) fn read_for_resume(home: &Path, thread_id: &str) -> Result<Value> {
+    // 原生 resume 会把全局默认值写成设置事件，冷启动只信任确认选择和实际轮次。
+    read_saved(home, thread_id, false)
+}
+
+fn read_saved(home: &Path, thread_id: &str, include_applied_settings: bool) -> Result<Value> {
     validate_thread_id(thread_id)?;
     let home = home.canonicalize().context("找不到 Codex 数据目录")?;
     let confirmed = confirmed_model(&home, thread_id)?;
@@ -295,6 +328,9 @@ pub(crate) fn read(home: &Path, thread_id: &str) -> Result<Value> {
                 .map(str::to_owned);
         }
         let applied_settings = own_settings(&record, thread_id);
+        if applied_settings && !include_applied_settings {
+            continue;
+        }
         let payload = match record["type"].as_str() {
             Some("turn_context") if identity.owns_turn(&record, thread_id) => &record["payload"],
             Some("event_msg") if applied_settings => &record["payload"]["thread_settings"],
@@ -567,6 +603,35 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cold_resume_ignores_native_default_settings_but_accepts_new_turns() {
+        let home = rollout_home();
+        let mut records = vec![
+            json!({"type":"session_meta","payload":{"id":"saved","model_provider":"provider"}}),
+            json!({"timestamp":"1970-01-01T00:00:01Z","type":"turn_context",
+                "payload":{"model":"legacy/model","effort":"low"}}),
+            json!({"timestamp":"1970-01-01T00:00:03Z","type":"event_msg",
+                "payload":{"type":"thread_settings_applied","thread_id":"saved",
+                    "thread_settings":{"model":"default/model","reasoning_effort":"medium"}}}),
+        ];
+        write_rollout(home.path(), &records);
+        assert_eq!(read(home.path(), "saved").unwrap()["model"], "default/model");
+        let legacy = read_for_resume(home.path(), "saved").unwrap();
+        assert_eq!(legacy["model"], "legacy/model");
+        assert_eq!(legacy["reasoningEffort"], "low");
+        super::remember_settings(home.path(), "saved", "selected/model", Some("provider"),
+            Some(2000), Some(&json!("high"))).unwrap();
+        let selected = read_for_resume(home.path(), "saved").unwrap();
+        assert_eq!(selected["model"], "selected/model");
+        assert_eq!(selected["reasoningEffort"], "high");
+        records.push(json!({"timestamp":"1970-01-01T00:00:04Z","type":"turn_context",
+            "payload":{"model":"new-turn/model","effort":"max"}}));
+        write_rollout(home.path(), &records);
+        let latest = read_for_resume(home.path(), "saved").unwrap();
+        assert_eq!(latest["model"], "new-turn/model");
+        assert_eq!(latest["reasoningEffort"], "max");
     }
 
     fn inherited_metadata() -> Vec<Value> {
@@ -1105,22 +1170,95 @@ mod tests {
     #[test]
     fn concurrent_notifications_keep_latest_selection() {
         let home = tempfile::tempdir().unwrap();
+        let start = std::sync::Barrier::new(12);
         std::thread::scope(|scope| {
             for timestamp in 1..=12 {
                 let home = home.path();
+                let start = &start;
                 scope.spawn(move || {
-                    remember_settings(
+                    start.wait();
+                    super::remember_settings(
                         home,
                         "saved",
                         &format!("model-{timestamp}"),
-                        None,
+                        Some(&format!("provider-{timestamp}")),
                         Some(timestamp),
+                        Some(&json!(if timestamp == 12 { "high" } else { "low" })),
                     )
                     .unwrap()
                 });
             }
         });
-        assert_eq!(read(home.path(), "saved").unwrap()["model"], "model-12");
+        assert_eq!(
+            read(home.path(), "saved").unwrap(),
+            json!({"status":"ok", "threadId":"saved", "model":"model-12",
+                "modelProvider":"provider-12", "reasoningEffort":"high"})
+        );
+    }
+
+    #[test]
+    fn queued_notifications_wait_for_local_writer_before_file_lock_timeout() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let home = tempfile::tempdir().unwrap();
+        remember_settings(home.path(), "saved", "initial", None, Some(1)).unwrap();
+        let store = home
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("codey-session-models");
+        let lock_path = store.join("saved.lock");
+        let local_lock = settings_write_lock(&lock_path).unwrap();
+        let local_guard = local_lock.lock().unwrap();
+        // 其他会话不等待本会话，重复查询仍取得同一把进程内锁。
+        let same_lock = settings_write_lock(&lock_path).unwrap();
+        assert!(same_lock.try_lock().is_err());
+        let other_lock = settings_write_lock(&store.join("other.lock")).unwrap();
+        let _other_guard = other_lock.try_lock().unwrap();
+        let file_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&file_lock).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for timestamp in [3, 2] {
+                let home = home.path();
+                let started_tx = started_tx.clone();
+                let completed_tx = completed_tx.clone();
+                scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    completed_tx
+                        .send(remember_settings(
+                            home,
+                            "saved",
+                            &format!("model-{timestamp}"),
+                            None,
+                            Some(timestamp),
+                        ))
+                        .unwrap();
+                });
+            }
+            for _ in 0..2 {
+                started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            // 模拟本进程的慢写入超过文件锁额度，排队通知应继续等待。
+            let premature = completed_rx.recv_timeout(Duration::from_secs(3));
+            fs2::FileExt::unlock(&file_lock).unwrap();
+            drop(local_guard);
+            assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+            for _ in 0..2 {
+                completed_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+        assert_eq!(read(home.path(), "saved").unwrap()["model"], "model-3");
     }
 
     #[test]

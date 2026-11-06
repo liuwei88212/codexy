@@ -20,7 +20,7 @@ test("Fast access follows model tiers for every login and third-party routes kee
 
     const ultraQuerySource = [
       "const ultraGate={},queryFactory=(_,factory)=>factory;",
-      "const query=queryFactory(null,({includeUltraReasoningEffort:i,isCustomModelProvider:a},",
+      "const query=queryFactory(null,({includeUltraReasoningEffort:i,isCustomModelProvider:a,modelCatalogPath:c},",
       "{get:l})=>{let m=i&&l(ultraGate,`1186680773`);",
       "return {select:({data:r,enabledReasoningEfforts:n})=>r.map(e=>({...e,",
       "supportedReasoningEfforts:e.supportedReasoningEfforts.filter(",
@@ -113,6 +113,21 @@ test("Fast access follows model tiers for every login and third-party routes kee
     }
     assert.deepEqual(records, [], "current Fast shapes must patch without compatibility errors");
 
+    // Codex 26.1021 host services pass the same Ultra gate into the model
+    // picker but hold no model catalog query; leave that chunk untouched.
+    const hostServicesSource = [
+      "function Hs(t,e,c){return Sm({hostId:e.hostId,includeUltraReasoningEffort:Kl(t,`1186680773`),",
+      "isAuthLoading:c.isLoading,isCustomModelProvider:e.isCustomModelProvider})}",
+    ].join("");
+    assert.equal(
+      globalThis.__codeyRendererPatchEntry(
+        "app://-/assets/initialize-app-host-services-5891c906a171.js",
+        hostServicesSource,
+      ),
+      null,
+    );
+    assert.deepEqual(records, [], "a gate argument without the catalog query is not a drift");
+
     // Assets outside the patch set return null so the paused request keeps its
     // original body — the entry never reads or clones them.
     for (const url of [
@@ -161,15 +176,16 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
   assert.match(restartFlow, /restart_task/);
   assert.match(restartFlow, /oneshot::channel\(\)/);
   assert.match(restartFlow, /is_shutting_down\(\)/);
-  assert.match(restartFlow, /request_shutdown_with_reason\(super::AppShutdownReason::RuntimeRestartFailed\)/);
+  assert.match(
+    restartFlow,
+    /request_shutdown_with_reason\(super::AppShutdownReason::RuntimeRestartFailed\)/,
+  );
   assert.match(
     runtimeSource,
     /pub async fn begin_shutdown[\s\S]*?cancel\.send\(\(\)\)[\s\S]*?task\.await/,
   );
-  assert.match(
-    runtimeSource,
-    /let current_generation = exit_state\.runtime_generation\.load\(Ordering::Acquire\);\s*let current_runtime = current_generation == runtime_generation;/,
-  );
+  // 当前运行代、崩溃恢复与退出竞争由 Rust 生命周期测试验证。
+
   assert.match(
     launcherModules,
     /stop_codex_processes\([\s\S]*?&self\.codex_app_path,[\s\S]*?self\.process_id,[\s\S]*?self\.process_group_id/,

@@ -574,6 +574,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   todayResetAt.setHours(23, 45, 0, 0);
   const tomorrowResetAt = new Date(todayResetAt);
   tomorrowResetAt.setDate(todayResetAt.getDate() + 1);
+  const appServerCreditExpiresAt = Math.floor(Date.now() / 1000) + 6 * 3600;
   let accountUsageResult = {
     status: "ok",
     planType: "pro",
@@ -593,6 +594,10 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
       unlimited: false,
       balance: "42",
     },
+    resetCredits: {
+      availableCount: 3,
+      nextExpiresAt: Math.floor(tomorrowResetAt.getTime() / 1000),
+    },
   };
   let accountUsageCalls = 0;
   let appServerUsageCalls = 0;
@@ -610,6 +615,13 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
         balance: "77",
       },
       planType: "plus",
+    },
+    rateLimitResetCredits: {
+      availableCount: 2,
+      credits: [
+        { id: "credit-1", status: "available", expiresAt: appServerCreditExpiresAt },
+        { id: "credit-2", status: "redeemed", expiresAt: Math.floor(tomorrowResetAt.getTime() / 1000) },
+      ],
     },
     rateLimitsByLimitId: {
       codex_bengalfox: {
@@ -633,6 +645,11 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
       if (path === "/api/store_official_account_usage") {
         assert.equal(args.authGeneration, 1);
         assert.equal(args.snapshot.primary.usedPercent, 20);
+        assert.equal(args.snapshot.resetCredits.availableCount, 2);
+        assert.equal(
+          args.snapshot.resetCredits.nextExpiresAt,
+          appServerCreditExpiresAt,
+        );
         assert.ok(args.snapshot.fetchedAt > 0);
         return { status: "ok" };
       }
@@ -681,15 +698,15 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.ok(usage);
   assert.ok(settingsButton);
   assert.ok(injectedStyle);
-  assert.match(injectedStyle.textContent, /#codey-account-usage \{[^}]*background: transparent;/);
+  assert.match(injectedStyle.textContent, /#codey-account-usage \{[^}]*border: 0;[^}]*background: light-dark\(#ffffff/);
   assert.doesNotMatch(injectedStyle.textContent, /#codey-account-usage \{[^}]*background:[^;}]*Canvas/);
+  assert.doesNotMatch(injectedStyle.textContent, /backdrop-filter/);
   assert.match(injectedStyle.textContent, /\.codey-usage-meter \{ display: block;[^}]*height: 3px;[^}]*max-height: 3px;/);
   assert.match(injectedStyle.textContent, /data-tone="normal"[^}]*--codey-usage-accent: light-dark\(/);
   assert.match(injectedStyle.textContent, /data-tone="warning"[^}]*--codey-usage-accent: light-dark\(/);
   assert.match(injectedStyle.textContent, /data-tone="critical"[^}]*--codey-usage-accent: light-dark\(/);
   assert.match(injectedStyle.textContent, /#codey-account-usage:hover \.codey-usage-details/);
-  assert.match(injectedStyle.textContent, /--codey-usage-surface: light-dark\(#ffffff, #252525\);/);
-  assert.match(injectedStyle.textContent, /\.codey-usage-details \{[^}]*background: var\(--codey-usage-surface\);/);
+  assert.match(injectedStyle.textContent, /\.codey-usage-details \{[^}]*border: 0;[^}]*background: light-dark\(#ffffff/);
   assert.doesNotMatch(injectedStyle.textContent, /#codey-account-usage\[data-state="stale"\] \{[^}]*opacity:/);
   assert.match(injectedStyle.textContent, /\.codey-usage-plan-tag \{[^}]*border:[^}]*background: color-mix\(in srgb, #0a84ff 13%, transparent\);/);
   assert.equal(usage.parentElement, sidebarFooterHost);
@@ -709,10 +726,15 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.match(summaryHtml, /class="codey-usage-plan-tag" data-pro-tier="200">Pro 200<\/span>[\s\S]*?周额度[\s\S]*?60%/);
   assert.doesNotMatch(summaryHtml, /余额|42/);
   assert.match(usage.innerHTML, /class="codey-usage-details" role="tooltip"/);
-  assert.match(usage.innerHTML, /5 小时额度[\s\S]*?剩余 85%[\s\S]*?已用 15%/);
-  assert.match(usage.innerHTML, /周额度[\s\S]*?剩余 60%[\s\S]*?已用 40%/);
+  assert.match(usage.innerHTML, /5 小时额度[\s\S]*?今天 \d{2}:\d{2} 重置[\s\S]*?codey-usage-detail-percent">85%/);
+  assert.match(usage.innerHTML, /周额度[\s\S]*?明天 \d{2}:\d{2} 重置[\s\S]*?codey-usage-detail-percent">60%/);
+  assert.doesNotMatch(usage.innerHTML, /已用|detail-value">剩余/);
   assert.match(usage.innerHTML, /Credits 余额[\s\S]*?42/);
   assert.match(usage.innerHTML, /更新于 \d{2}:\d{2}/);
+  assert.match(usage.innerHTML, /额度详情[\s\S]*?更新于 \d{2}:\d{2}/);
+  assert.match(usage.innerHTML, /剩余重置次数[\s\S]*?3 次[\s\S]*?明天 \d{2}:\d{2} 过期/);
+  assert.equal(usage.dataset.creditExpiring, undefined);
+  assert.doesNotMatch(usage.innerHTML, /codey-usage-credit-dot/);
   assert.equal(usage.dataset.windowCount, "2");
   assert.equal(usage.dataset.plan, undefined);
   assert.equal(usage.getAttribute("tabindex"), "0");
@@ -733,11 +755,15 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     ...accountUsageResult,
     primary: accountUsageResult.secondary,
     secondary: null,
+    credits: { hasCredits: false, unlimited: false, balance: "0" },
+    resetCredits: { availableCount: 0, nextExpiresAt: Math.floor(Date.now() / 1000) + 3600 },
   };
   await window.__codeyRefreshAccountUsage();
   assert.equal(usage.dataset.windowCount, "1");
   assert.match(usage.innerHTML, /周额度/);
   assert.doesNotMatch(usage.innerHTML, /data-window="five-hour"/);
+  assert.doesNotMatch(usage.innerHTML, /Credits 余额|剩余重置次数|codey-usage-credit-dot/);
+  assert.equal(usage.dataset.creditExpiring, undefined);
 
   accountUsageResult = { status: "error", message: "官方额度接口返回 401", authGeneration: 1 };
   appServerUsageResult.rateLimits.primary.resetsAt = Math.floor(Date.now() / 1000) + 29.5 * 60 * 60;
@@ -749,6 +775,11 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.doesNotMatch(usage.getAttribute("aria-label"), /5 小时额度/);
   assert.match(usage.getAttribute("aria-label"), /1 天 5 小时后重置/);
   assert.match(usage.innerHTML, /Credits 余额[\s\S]*?77/);
+  assert.match(usage.innerHTML, /剩余重置次数[\s\S]*?2 次[\s\S]*?\d{2}:\d{2} 过期/);
+  assert.equal(usage.dataset.creditExpiring, "true");
+  assert.match(usage.innerHTML, /codey-usage-credit-dot[\s\S]*?codey-usage-plan-tag/);
+  assert.match(usage.innerHTML, /剩余重置次数[\s\S]*?codey-usage-credit-dot[\s\S]*?is-expiring[\s\S]*?过期/);
+  assert.match(usage.getAttribute("aria-label"), /重置次数即将过期/);
   assert.match(usage.innerHTML, /class="codey-usage-plan-tag" data-plan="plus">Plus<\/span>/);
 
   accountUsageResult = { status: "unavailable", reason: "third_party" };
@@ -1157,11 +1188,19 @@ test("marks the Codey icon unavailable after consecutive hung health checks and 
   assert.equal(button.getAttribute("data-codey-runtime-state"), "unavailable");
   assert.match(button.getAttribute("aria-label"), /Codey 连接中断/);
   assert.match(button.title, /Codey 后端未响应/);
+  assert.ok(
+    fixture.activeTimers().some((candidate) => candidate.delay === 5_000),
+    "an unavailable backend should be rechecked quickly",
+  );
   button.dispatchEvent({
     type: "click",
     preventDefault() {},
     stopPropagation() {},
   });
+  // 点击先当场复查，复查仍超时才提示。
+  assert.deepEqual(fixture.alerts, []);
+  fireLatestHealthTimeout();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(fixture.alerts, [
     "Codey 与 Codex 的连接已中断，当前配置面板无法连接。"
     + "Codey 会继续尝试自动恢复；若长时间仍未恢复，请退出 Codex 后重新启动 Codey。",
@@ -1174,6 +1213,55 @@ test("marks the Codey icon unavailable after consecutive hung health checks and 
   assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置");
   assert.equal(button.title, "打开 Codey 配置");
   assert.equal(fixture.window.__codeyRuntimeHealth.consecutiveFailures, 0);
+});
+
+test("opens settings instead of warning when a stale unavailable state has recovered", async () => {
+  let healthy = false;
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+    if (path === "/backend/health") {
+      return healthy ? { status: "ok" } : { status: "failed", code: "bridge_unavailable" };
+    }
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const button = fixture.document.getElementById("codey-settings-button");
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "unavailable");
+
+  let toggles = 0;
+  fixture.window.__codeySettingsOverlay = { toggle: () => { toggles += 1; } };
+  healthy = true;
+  button.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(fixture.alerts, []);
+  assert.equal(toggles, 1);
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "healthy");
+});
+
+test("does not count bridge rebuilds or renderer stalls as backend failures", async () => {
+  let healthResult = { status: "failed", code: "bridge_reinstalled" };
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+    if (path === "/backend/health") return healthResult;
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.window.__codeyRuntimeHealth?.consecutiveFailures ?? 0, 0);
+
+  // 主线程卡住时超时回调远晚于预算才触发，同样不能据此判定后端中断。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    healthResult = new Promise(() => {});
+    const check = fixture.window.__codeyRefreshRuntimeHealth();
+    fixture.advanceClock(10_000);
+    const timeout = fixture.activeTimers().filter((timer) => timer.delay === 3_250).at(-1);
+    timeout.cleared = true;
+    timeout.callback();
+    await check;
+  }
+  const button = fixture.document.getElementById("codey-settings-button");
+  assert.notEqual(button.getAttribute("data-codey-runtime-state"), "unavailable");
+  assert.equal(fixture.window.__codeyRuntimeHealth?.consecutiveFailures ?? 0, 0);
 });
 
 test("pauses Codey health checks while the page is hidden and resumes immediately", async () => {
@@ -1565,4 +1653,44 @@ test("MCP reload bootstrap talks to the patched App Server client", async () => 
   });
   assert.equal((await window.__codeyReloadMcpServers()).ok, true);
   assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
+});
+
+test("settings overlay preloads on a hover dwell, press, or focus but not a drive-by pass", async () => {
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+    if (path === "/backend/health") return { status: "ok" };
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const button = fixture.document.getElementById("codey-settings-button");
+  let loads = 0;
+  fixture.window.__codeySettingsOverlay = {
+    __codeyLazyLoader: true,
+    load: async () => {
+      loads += 1;
+      throw new Error("passive preload failures stay silent");
+    },
+    toggle() {},
+  };
+  const preloadTimer = () => fixture.activeTimers().filter((timer) => timer.delay === 120).at(-1);
+
+  button.dispatchEvent({ type: "pointerenter" });
+  const pass = preloadTimer();
+  assert.equal(pass?.cleared, false, "hovering schedules a preload");
+  button.dispatchEvent({ type: "pointerleave" });
+  assert.equal(pass.cleared, true, "a drive-by pass cancels the preload");
+  assert.equal(loads, 0);
+
+  button.dispatchEvent({ type: "pointerenter" });
+  const dwell = preloadTimer();
+  dwell.cleared = true;
+  dwell.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(loads, 1);
+
+  button.dispatchEvent({ type: "pointerdown" });
+  button.dispatchEvent({ type: "focus" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(loads, 3);
+  assert.deepEqual(fixture.alerts, []);
 });
