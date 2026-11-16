@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "82";
+  const patchVersion = "83";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -373,7 +373,9 @@
     const currentProviderId = providerBoundExistingThreadMethods.has(method)
       ? (threadId ? knownThreadProvider(source) : paramsProviderId(source))
       : "";
-    const routedProviderId = localRouterProviderId;
+    // 官方旧会话保留原生身份，实际请求由启动时的 openai_base_url 接入网关。
+    const routedProviderId = currentProviderId === officialProviderId
+      ? officialProviderId : localRouterProviderId;
     // The native catalog declares capabilities for each selector. Keep that
     // identity through turn/start so the gateway can distinguish a new choice
     // from route metadata retained by app-server from an earlier turn.
@@ -394,7 +396,7 @@
       // provider transport owned by the launcher even for restored tasks.
       if (source.config && typeof source.config === "object") {
         next.config = Object.fromEntries(Object.entries(source.config).filter(([key]) => (
-          key !== "model_provider" && !key.startsWith("model_provider.")
+          key !== "openai_base_url" && key !== "model_provider" && !key.startsWith("model_provider.")
           && key !== "model_providers" && !key.startsWith("model_providers.")
         )));
       }
@@ -3104,6 +3106,8 @@
     if (pending?.nativeModelUpdate && threadRoutes.delete(pending.threadId)) persistThreadRoutes();
     const method = pending?.method || data?.requestMethod || message.requestMethod
       || (modelListRequestIds.has(requestId) ? "model/list" : "");
+    // 模型目录响应不能作为会话身份或运行时线路的确认依据。
+    if (method === "model/list") return;
     const result = restoredThreadRuntimePayload(method, message.result);
     if (result !== message.result) {
       try {

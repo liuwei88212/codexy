@@ -681,7 +681,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
         requires_openai_auth: true,
     };
 
-    apply_isolated_runtime_router_config(
+    let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
@@ -706,6 +706,19 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
         fs::read_to_string(home.join("config.toml")).unwrap(),
         original_config
     );
+    assert!(applied.runtime_config_overrides.iter().any(|entry| {
+        entry == &format!(
+            "openai_base_url={}",
+            toml_string_literal(&endpoint.native_openai_base_url())
+        )
+    }));
+    assert!(applied.runtime_config_overrides.iter().any(|entry| {
+        entry.starts_with("model_providers.codey_router_remote.base_url=")
+    }));
+    assert!(applied
+        .runtime_config_overrides
+        .iter()
+        .all(|entry| !entry.starts_with("model_providers.openai.")));
     assert!(prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
     let live = fs::read_to_string(home.join("config.toml"))
         .unwrap()
@@ -883,7 +896,11 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     assert!(
         rendered.contains("model_providers.codey_router.base_url=\"http://127.0.0.1:43127/v1\"")
     );
-    assert!(!rendered.contains("openai_base_url="));
+    assert!(rendered.contains(&format!(
+        "openai_base_url={}",
+        toml_string_literal(&endpoint.native_openai_base_url())
+    )));
+    assert!(!rendered.contains("model_providers.openai."));
 }
 
 #[test]
@@ -3509,7 +3526,11 @@ experimental_bearer_token = "upstream-secret-token"
     );
     assert!(!rendered.contains("upstream-secret.example"));
     assert!(!rendered.contains("upstream-secret-token"));
-    assert!(!rendered.contains("openai_base_url="));
+    assert!(rendered.contains(&format!(
+        "openai_base_url={}",
+        toml_string_literal(&endpoint.native_openai_base_url())
+    )));
+    assert!(!rendered.contains("model_providers.openai."));
 }
 
 #[test]
@@ -3628,7 +3649,11 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     assert!(rendered.contains("model_providers.codey_router.supports_websockets=true"));
     assert!(rendered.contains("x-codey-router-token"));
     assert!(!rendered.contains("model_providers.codey_router.experimental_bearer_token="));
-    assert!(!rendered.contains("openai_base_url="));
+    assert!(rendered.contains(&format!(
+        "openai_base_url={}",
+        toml_string_literal(&endpoint.native_openai_base_url())
+    )));
+    assert!(!rendered.contains("model_providers.openai."));
 }
 
 #[test]

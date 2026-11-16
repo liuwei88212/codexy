@@ -589,7 +589,7 @@ fn apply_isolated_runtime_router_config(
         &mut effective_document,
         local_router.and(model_contexts),
     )?;
-    let runtime_config_overrides = build_isolated_runtime_overrides(
+    let mut runtime_config_overrides = build_isolated_runtime_overrides(
         &effective_document,
         &runtime_agents,
         fastctx_namespace,
@@ -598,6 +598,23 @@ fn apply_isolated_runtime_router_config(
         scope_guard,
         stream_max_retries,
     )?;
+    if let Some(endpoint) = local_router {
+        // 只在本次启动覆盖官方传输地址，不改变旧会话身份或用户的持久配置。
+        push_runtime_override_value(
+            &mut runtime_config_overrides,
+            "openai_base_url",
+            &Value::from(endpoint.native_openai_base_url()),
+        );
+        let legacy = runtime_config_overrides
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .strip_prefix("model_providers.codey_router.")
+                    .map(|suffix| format!("model_providers.codey_router_remote.{suffix}"))
+            })
+            .collect::<Vec<_>>();
+        runtime_config_overrides.extend(legacy);
+    }
 
     create_private_dir_all(backup_root)?;
     prune_stale_backup_dirs(backup_root, marker);

@@ -3,6 +3,88 @@ use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::ProviderProfile;
 
 #[test]
+fn native_openai_capability_is_limited_to_model_endpoints() {
+    let endpoint = RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "test-capability".into(),
+        supports_websockets: false,
+        supports_remote_compaction: false,
+        requires_openai_auth: true,
+    };
+    assert_eq!(
+        endpoint.native_openai_base_url(),
+        "http://127.0.0.1:43127/codey-native/test-capability/v1"
+    );
+    for suffix in [
+        "responses",
+        "responses/compact",
+        "models",
+        "images/generations",
+        "images/edits",
+    ] {
+        let path = format!("/codey-native/test-capability/v1/{suffix}");
+        assert_eq!(
+            native_openai_path(&path, "test-capability"),
+            Some(format!("/v1/{suffix}").as_str())
+        );
+        assert_eq!(native_openai_path(&path, "wrong-token"), None);
+    }
+    for path in [
+        "/codey-native/test-capability/codey/api/query_official_account_usage",
+        "/codey-native/test-capability/v1/../codey/concurrency",
+        "/codey-native/test-capability/v1/responses/extra",
+        "/codey-native//v1/models",
+        "/v1/models",
+    ] {
+        assert_eq!(native_openai_path(path, "test-capability"), None);
+    }
+    assert_eq!(native_openai_path("/codey-native//v1/models", ""), None);
+}
+
+#[tokio::test]
+async fn native_openai_http_and_websocket_require_the_capability() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (url, status) in [
+        (format!("{}/models", endpoint.native_openai_base_url()), 200),
+        (format!("{}/models", endpoint.base_url), 401),
+        (
+            format!(
+                "{}/models",
+                endpoint.native_openai_base_url().replace(&endpoint.token, "wrong")
+            ),
+            401,
+        ),
+        (
+            format!("{}/../codey/concurrency", endpoint.native_openai_base_url()),
+            401,
+        ),
+    ] {
+        assert_eq!(
+            client.get(url).send().await.unwrap().status().as_u16(),
+            status
+        );
+    }
+    let url = format!(
+        "{}/responses",
+        endpoint.native_openai_base_url().replacen("http://", "ws://", 1)
+    );
+    let (mut socket, _) = connect_async_with_config(url, None, false).await.unwrap();
+    socket.close(None).await.unwrap();
+    let wrong = format!(
+        "{}/responses",
+        endpoint
+            .native_openai_base_url()
+            .replace(&endpoint.token, "wrong")
+            .replacen("http://", "ws://", 1)
+    );
+    assert!(connect_async_with_config(wrong, None, false).await.is_err());
+    router.stop().await.unwrap();
+}
+
+#[test]
 fn request_log_catalog_exposes_login_status_independently_of_profiles() {
     let mut official = ProviderProfile::new("OpenAI 官方直登");
     official.source_provider_id = Some("openai".into());

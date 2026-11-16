@@ -752,14 +752,20 @@ fn forward_app_server_input(
                     }
                 }
                 let provider = router_provider_for_params(&method, params, runtime_overrides);
-                params.insert("modelProvider".into(), provider.into());
+                if method == "thread/resume" {
+                    // 恢复必须沿用磁盘上的 Provider；强制切换载体会被原生 CLI 拒绝。
+                    params.remove("modelProvider");
+                } else {
+                    params.insert("modelProvider".into(), provider.into());
+                }
                 params.remove("model_provider");
                 if let Some(config) = params
                     .get_mut("config")
                     .and_then(serde_json::Value::as_object_mut)
                 {
                     config.retain(|key, _| {
-                        key != "model_provider"
+                        key != "openai_base_url"
+                            && key != "model_provider"
                             && !key.starts_with("model_provider.")
                             && key != "model_providers"
                             && !key.starts_with("model_providers.")
@@ -2025,6 +2031,7 @@ mod tests {
                 "params": { "threadId": "old-thread", "model": "route-second/gpt-6-astra",
                     "modelProvider": null, "config": { "model_provider": "first",
                         "model_provider.name": "first", "model_providers": {"first": {}},
+                        "openai_base_url": "https://wrong.example/v1",
                         "model_providers.codey_router.base_url": "https://wrong.example",
                         "service_tier": "fast", "artifact.session": "keep" } }
             });
@@ -2043,13 +2050,17 @@ mod tests {
             .unwrap();
             let first_line = output.iter().position(|byte| *byte == b'\n').unwrap();
             let routed: serde_json::Value = serde_json::from_slice(&output[..first_line]).unwrap();
-            assert_eq!(
-                routed,
-                serde_json::json!({ "id": 17, "method": method,
+            let mut expected = serde_json::json!({ "id": 17, "method": method,
                     "params": { "threadId": "old-thread", "model": "route-second/gpt-6-astra",
                         "modelProvider": "codey_router", "config": { "service_tier": "fast", "artifact.session": "keep" } }
-                })
-            );
+                });
+            if method == "thread/resume" {
+                expected["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("modelProvider");
+            }
+            assert_eq!(routed, expected);
             assert_eq!(&output[first_line + 1..], passthrough);
         }
     }
@@ -2275,7 +2286,14 @@ mod tests {
                 route_local_app_server_input(input.as_bytes(), &mut output, &overrides, None)
                     .unwrap();
                 let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
-                assert_eq!(result["params"]["modelProvider"], provider);
+                assert_eq!(
+                    result["params"]["modelProvider"],
+                    if method == "thread/resume" {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::from(provider)
+                    }
+                );
             }
         }
         let empty = serde_json::Map::new();
@@ -2343,7 +2361,11 @@ mod tests {
                         )
                         .unwrap();
                         let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
-                        params["modelProvider"] = "codey_router".into();
+                        if method == "thread/resume" {
+                            params.as_object_mut().unwrap().remove("modelProvider");
+                        } else {
+                            params["modelProvider"] = "codey_router".into();
+                        }
                         assert_eq!(result["params"], params);
                     }
                 }

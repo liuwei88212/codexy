@@ -1463,68 +1463,19 @@ async fn rejected_response_releases_request_memory_before_reading_its_body() {
     upstream.await.unwrap();
 }
 
-// 恢复测试使用真实 TCP 与真实时钟，避免虚拟时钟早于操作系统投递响应而跳到超时。
 #[tokio::test]
-async fn network_retry_waits_a_minute_and_recovers_without_ending_the_request() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let upstream = tokio::spawn(async move {
-        let mut received = Vec::new();
-        for index in 0..3 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let request = read_http_request(&mut socket).await.unwrap();
-            received.push((tokio::time::Instant::now(), request.body));
-            if index == 2 {
-                write_json_response(&mut socket, 200, &json!({"id":"recovered"}))
-                    .await.unwrap();
-            }
-            socket.shutdown().await.unwrap();
-        }
-        received
-    });
-    let (config, provider, model) = super::tests::router_config(url.clone());
-    let server = test_server(&config);
-    let resolved = RouterSnapshot::from_config(&config)
-        .target_for_model(&model_alias(&provider, &model)).unwrap();
-    let endpoint = format!("{url}/responses");
-    let execution = HttpExecution {
-        server: &server, resolved: &resolved, bridge: ProtocolBridge::NativeResponses,
-        request_kind: ResponsesRequestKind::Create, compacting: false,
-        native_compaction: false, compaction_phase: GatewayCompactionPhase::GatewaySummary,
-        upstream_url: &endpoint, upstream_stream_requested: true,
-    };
-    let available = server.request_body_budget.available_permits();
-    let request = EncodedHttpRequest {
-        body: Bytes::from_static(b"{\"input\":\"keep this turn\"}"),
-        admission: Some(server.request_body_budget.clone().try_acquire_many_owned(4).unwrap()),
-    };
-    let mut downstream = CapturedDownstream::default();
-    let mut lifecycle = LifecycleRequest::inert();
-    let mut headers = HeaderMap::new();
-    let client = server.client.cached();
-    let result = tokio::time::timeout(Duration::from_secs(600), execution.send(
-        &mut downstream, &mut lifecycle, &client, &mut headers, request, &[]
-    )).await.unwrap().unwrap().unwrap();
-    assert!(matches!(result, ReceivedHttpResponse::Success(_)));
-    assert!(downstream.response_started);
-    assert_eq!(downstream.status, None);
-    assert_eq!(server.request_body_budget.available_permits(), available);
-    let received = upstream.await.unwrap();
-    for pair in received.windows(2) {
-        assert!(pair[1].0.duration_since(pair[0].0) >= Duration::from_secs(60));
-        assert_eq!(pair[0].1, pair[1].1);
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn network_retry_can_be_cancelled_during_the_minute_wait() {
+async fn uploaded_request_is_not_replayed_when_response_headers_are_lost() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        read_http_request(&mut socket).await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        assert_eq!(request.body, b"{\"input\":\"send only once\"}");
+        // 上游已经收到正文，但响应头之前断开；不能据此再次执行整轮请求。
         socket.shutdown().await.unwrap();
-        listener
+        drop(socket);
+        assert!(tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await.is_err());
     });
     let (config, provider, model) = super::tests::router_config(url.clone());
     let server = test_server(&config);
@@ -1539,24 +1490,18 @@ async fn network_retry_can_be_cancelled_during_the_minute_wait() {
     };
     let available = server.request_body_budget.available_permits();
     let request = EncodedHttpRequest {
-        body: Bytes::from_static(b"{\"input\":\"cancel this turn\"}"),
+        body: Bytes::from_static(b"{\"input\":\"send only once\"}"),
         admission: Some(server.request_body_budget.clone().try_acquire_many_owned(4).unwrap()),
     };
-    let mut downstream = CapturedDownstream {
-        cancel_at: Some(tokio::time::Instant::now() + Duration::from_secs(30)),
-        ..Default::default()
-    };
-    let mut lifecycle = LifecycleRequest::inert();
-    let mut headers = HeaderMap::new();
-    let client = server.client.cached();
-    let result = execution.send(&mut downstream, &mut lifecycle, &client,
-        &mut headers, request, &[]).await;
-    assert!(result.err().unwrap().is::<DownstreamClosed>());
-    assert!(downstream.response_started);
-    assert_eq!(downstream.status, None);
+    let mut downstream = CapturedDownstream::default();
+    let result = tokio::time::timeout(Duration::from_secs(5), execution.send(
+        &mut downstream, &mut LifecycleRequest::inert(), &server.client.cached(),
+        &mut HeaderMap::new(), request, &[],
+    )).await.unwrap().unwrap();
+    assert!(result.is_none());
+    assert_eq!(downstream.status, Some(424));
     assert_eq!(server.request_body_budget.available_permits(), available);
-    let listener = upstream.await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.is_err());
+    upstream.await.unwrap();
 }
 
 #[tokio::test]

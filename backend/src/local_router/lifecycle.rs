@@ -402,13 +402,20 @@ where
         lifecycle.apply_api_key(headers)?;
         await_upstream(downstream, lifecycle.mint_turn_state(client)).await??;
         lifecycle.apply_turn_state(headers)?;
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.set_upstream_request_headers(&format_upstream_headers(headers));
-        }
         let payload = retained_body
             .as_ref()
             .expect("plugin retry keeps the uploaded body")
             .clone();
+        // 线路和修复逻辑仍持有明文正文及原始头，避免重试时把明文误标为 zstd。
+        let mut wire_headers = headers.clone();
+        let payload = if plugin.is_none() {
+            encode_http_request_body(url.as_str(), &mut wire_headers, payload)
+        } else {
+            payload
+        };
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.set_upstream_request_headers(&format_upstream_headers(&wire_headers));
+        }
         // 以这条请求启动时的插件快照为准。上传过程中全局插件被关掉时，
         // 快照仍可能在响应头之后要求重发，正文必须还在。
         let keep_uploaded_body = lifecycle.is_active();
@@ -433,7 +440,7 @@ where
                 codey_plugin_sdk::transport::Operation::Responses,
                 client,
                 url.as_str(),
-                headers,
+                &wire_headers,
                 payload,
                 timeout,
                 &mut || {
@@ -548,6 +555,26 @@ pub(super) async fn send_route_response_headers(
         )
         .await
     }
+}
+
+fn encode_http_request_body(url: &str, headers: &mut HeaderMap, body: Bytes) -> Bytes {
+    // 只对已知支持 zstd 的官方 Codex 接口压缩，第三方和插件传输保持原契约。
+    let official = url
+        .strip_suffix("/responses/compact")
+        .or_else(|| url.strip_suffix("/responses"))
+        .is_some_and(crate::codex_provider::is_official_base_url);
+    if !official || body.len() < 1024 || headers.contains_key(CONTENT_ENCODING) {
+        return body;
+    }
+    // 压缩仅是传输优化；失败或不省空间时仍发送原 JSON，不额外重试模型请求。
+    if let Ok(encoded) = zstd::stream::encode_all(Cursor::new(body.as_ref()), 1)
+        && encoded.len() < body.len()
+    {
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        return encoded.into();
+    }
+    body
 }
 
 /// 汇总写回的错误与传输结果，避免 HTTP 错误成功写回时被误报为请求完成。
@@ -723,6 +750,98 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_compression_is_limited_to_supported_official_endpoints() {
+        let original = Bytes::from(format!("{{\"input\":\"{}\"}}", "history ".repeat(4096)));
+        for path in ["responses", "responses/compact"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&original.len().to_string()).unwrap(),
+            );
+            let encoded = encode_http_request_body(
+                &format!("https://chatgpt.com/backend-api/codex/{path}"),
+                &mut headers,
+                original.clone(),
+            );
+            assert_eq!(headers[CONTENT_ENCODING], "zstd");
+            assert!(!headers.contains_key(reqwest::header::CONTENT_LENGTH));
+            assert!(encoded.len() < original.len() / 10);
+            assert_eq!(
+                zstd::stream::decode_all(Cursor::new(encoded)).unwrap(),
+                original
+            );
+        }
+        for url in [
+            "https://relay.example/v1/responses",
+            "https://api.openai.com/v1/responses",
+            "https://chatgpt.com.example/backend-api/codex/responses",
+            "http://chatgpt.com/backend-api/codex/responses",
+            "https://chatgpt.com/backend-api/codex/images/generations",
+        ] {
+            let mut headers = HeaderMap::new();
+            assert_eq!(
+                encode_http_request_body(url, &mut headers, original.clone()),
+                original
+            );
+            assert!(!headers.contains_key(CONTENT_ENCODING));
+        }
+        let url = "https://chatgpt.com/backend-api/codex/responses";
+        let mut headers = HeaderMap::new();
+        let small = Bytes::from_static(b"{}");
+        assert_eq!(
+            encode_http_request_body(url, &mut headers, small.clone()),
+            small
+        );
+        assert!(!headers.contains_key(CONTENT_ENCODING));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(
+            encode_http_request_body(url, &mut headers, original.clone()),
+            original
+        );
+        assert_eq!(headers[CONTENT_ENCODING], "gzip");
+
+        headers.clear();
+        let mut seed = 1_u32;
+        let random = Bytes::from((0..4096).map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        }).collect::<Vec<_>>());
+        assert_eq!(encode_http_request_body(url, &mut headers, random.clone()), random);
+        assert!(!headers.contains_key(CONTENT_ENCODING));
+    }
+
+    #[tokio::test]
+    async fn compressed_request_upload_keeps_content_and_releases_admission() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let original = Bytes::from(format!("{{\"input\":\"{}\"}}", "history ".repeat(4096)));
+        let expected = original.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await.unwrap();
+            assert_eq!(incoming_header(&request, "content-encoding"), Some("zstd"));
+            assert!(request.body.len() < expected.len() / 10);
+            assert_eq!(zstd::stream::decode_all(Cursor::new(request.body)).unwrap(), expected);
+            write_json_response(&mut socket, 200, &json!({"ok":true})).await.unwrap();
+        });
+        let mut headers = HeaderMap::new();
+        let encoded = encode_http_request_body(
+            "https://chatgpt.com/backend-api/codex/responses", &mut headers, original,
+        );
+        let mut uploaded = 0;
+        let response = send_for_response_headers(
+            reqwest::Client::builder().no_proxy().build().unwrap()
+                .post(format!("http://{address}/responses")).headers(headers),
+            encoded, Duration::from_secs(5), || uploaded += 1,
+        ).await.unwrap().unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(uploaded, 1);
+        server.await.unwrap();
+    }
 
     #[test]
     fn lifecycle_email_comes_only_from_official_route_metadata() {

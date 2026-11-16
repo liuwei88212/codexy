@@ -317,7 +317,7 @@ test("the fallback request resolver restores marked compatibility resumes for lo
   runtime.patch.dispose();
 });
 
-test("unmarked, mismatched and remote compatibility replies do not relax provider protection", async () => {
+test("local OpenAI replies retain their carrier while external and remote replies stay protected", async () => {
   for (const [overrides, hostId] of [
     [{ codeyRuntimeModelProvider: undefined }, "local"],
     [{ codeyRuntimeModelProvider: "unknown-provider" }, "local"],
@@ -335,7 +335,7 @@ test("unmarked, mismatched and remote compatibility replies do not relax provide
     runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", hostId, message } });
     assert.equal(message.result.modelProvider, original.modelProvider);
     const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId, model: "gpt-6-astra" }));
-    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), true);
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), hostId !== "local" || original.modelProvider !== "openai");
     runtime.patch.dispose();
   }
 });
@@ -351,7 +351,7 @@ test("late marked resumes preserve runtime evidence alongside thread lists and s
     assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), false, "thread lists only update persisted providers");
   }
   compactionReply(runtime, `thread/resume:${threadId}`, compatibilityResumeResult(threadId, { codeyRuntimeModelProvider: undefined }));
-  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), true, "unmarked late OpenAI replies remain authoritative");
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn()), false, "native OpenAI uses the launch-time gateway URL");
   runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: {
     method: "thread/started", params: { thread: { id: threadId, modelProvider: "codey_router" } },
   } } });
@@ -381,9 +381,9 @@ test("a resume response without any provider cannot confirm the requested carrie
   runtime.patch.dispose();
 });
 
-test("non-Codey providers still require migration before route changes", async () => {
+test("providers without a configured gateway transport still require migration before route changes", async () => {
   const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
-  for (const modelProvider of ["openai", "local-official", "external-provider"]) {
+  for (const modelProvider of ["local-official", "external-provider"]) {
     for (const method of ["thread/settings/update", "turn/start"]) {
       const changed = runtime.patch.rewriteOutgoingMessage(compactionRequest(method, {
         threadId: modelProvider, model: "remote/shared", modelProvider,
@@ -1089,7 +1089,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "82");
+  assert.equal(patch.version, "83");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -2252,7 +2252,7 @@ test("unloaded catalogs and unknown models cannot bypass the runtime provider ch
           threadId: "late-task", model: "route-aizz/unknown-model", modelProvider: provider,
         } },
       });
-      assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), provider !== "codey_router");
+      assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), !["codey_router", "openai"].includes(provider));
       assert.equal(turn.request.params.model, "route-aizz/unknown-model");
     }
     for (const method of ["thread/start", "thread/resume", "thread/fork"]) {
@@ -2325,7 +2325,7 @@ test("stale turn route metadata is removed before the catalog finishes loading",
   runtime.patch.dispose();
 });
 
-test("a legacy OpenAI task resumes on the HTTP router even before catalog load", async () => {
+test("a legacy OpenAI task preserves its provider even before catalog load", async () => {
   const runtime = await loadPatch({ status: "failed" }, [statsigClient()]);
   const rewritten = runtime.patch.rewriteOutgoingMessage({
     type: "mcp-request",
@@ -2341,7 +2341,7 @@ test("a legacy OpenAI task resumes on the HTTP router even before catalog load",
 
   assert.deepEqual(rewritten.request.params, {
     threadId: "legacy-official-thread",
-    modelProvider: "codey_router",
+    modelProvider: "openai",
   });
   assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), false);
   runtime.patch.dispose();
@@ -2426,7 +2426,7 @@ test("an explicit runtime provider response takes precedence over the requested 
   runtime.patch.dispose();
 });
 
-test("a legacy official task resumes through the local router carrier", async () => {
+test("a legacy official task keeps its identity while switching routes through the gateway", async () => {
   const runtime = await loadPatch({
     status: "ok",
     models: ["gpt-5.6-sol", "relay/shared-model"],
@@ -2470,7 +2470,7 @@ test("a legacy official task resumes through the local router carrier", async ()
   assert.deepEqual(resumed.detail.request.params, {
     threadId: "official-thread",
     model: "gpt-5.6-sol",
-    modelProvider: "codey_router",
+    modelProvider: "openai",
   });
   assert.equal(runtime.patch.isBlockedOutgoingMessage(resumed.detail), false);
   runtime.dispatchWindowEvent("message", {
@@ -2480,14 +2480,13 @@ test("a legacy official task resumes through the local router carrier", async ()
         id: "resume-official-through-router",
         result: {
           thread: { id: "official-thread", modelProvider: "openai" },
-          modelProvider: "codey_router",
+          modelProvider: "openai",
         },
       },
     },
   });
 
-  // The rollout still reports `openai` after a successful runtime migration.
-  // A later list refresh must not downgrade the live carrier back to `openai`.
+  // 历史列表刷新不改变运行时身份，也不丢失后续模型的线路选择。
   runtime.dispatchWindowEvent("message", {
     data: {
       type: "mcp-response",
@@ -2524,7 +2523,7 @@ test("a legacy official task resumes through the local router carrier", async ()
   runtime.patch.dispose();
 });
 
-test("an id-less app-server resume records its router migration after request creation", async () => {
+test("an id-less app-server resume records its original OpenAI carrier after request creation", async () => {
   const alias = "relay/shared-model";
   const runtime = await loadPatch({
     status: "ok",
@@ -2562,7 +2561,7 @@ test("an id-less app-server resume records its router migration after request cr
   assert.deepEqual(preflight.request.params, {
     threadId: "id-less-resume-thread",
     model: "gpt-5.6-sol",
-    modelProvider: "codey_router",
+    modelProvider: "openai",
   });
 
   runtime.patch.trackOutgoingMessage({
@@ -2579,7 +2578,7 @@ test("an id-less app-server resume records its router migration after request cr
       message: {
         id: "created-after-preflight",
         result: {
-          modelProvider: "codey_router",
+          modelProvider: "openai",
           thread: {
             id: "id-less-resume-thread",
             modelProvider: "openai",
@@ -2791,7 +2790,7 @@ test("an external-provider thread resumes onto the router and switches to an off
   runtime.patch.dispose();
 });
 
-test("every official route requires the local router even on a legacy OpenAI task", async () => {
+test("every official route uses the gateway without changing a legacy OpenAI task's identity", async () => {
   for (const routeId of ["openai", "local-official", "chatgpt-account"]) {
     const model = routeId + "/gpt-5.6-sol";
     const runtime = await loadPatch({
@@ -2810,21 +2809,17 @@ test("every official route requires the local router even on a legacy OpenAI tas
       const request = runtime.patch.rewriteOutgoingMessage({
         type: "mcp-request", request: { method, params: { threadId: "official-task", model } },
       });
-      assert.equal(runtime.patch.isBlockedOutgoingMessage(request), true);
-      const blockedKey = Object.getOwnPropertySymbols(request.request.params).find((key) => (
-        key.description === "codeyBlockedProviderRequest"
-      ));
-      assert.equal(request.request.params[blockedKey].reason, "provider_migration_required");
+      assert.equal(runtime.patch.isBlockedOutgoingMessage(request), false);
     }
     const resume = runtime.patch.rewriteOutgoingMessage({
       type: "mcp-request", request: {
         id: "resume-official", method: "thread/resume", params: { threadId: "official-task", model },
       },
     });
-    assert.equal(resume.request.params.modelProvider, "codey_router");
+    assert.equal(resume.request.params.modelProvider, "openai");
     runtime.dispatchWindowEvent("message", { data: {
       type: "mcp-response", message: { id: "resume-official", result: {
-        thread: { id: "official-task", modelProvider: "openai" }, modelProvider: "codey_router",
+        thread: { id: "official-task", modelProvider: "openai" }, modelProvider: "openai",
       } },
     } });
     const turn = runtime.patch.rewriteOutgoingMessage({
@@ -2837,7 +2832,7 @@ test("every official route requires the local router even on a legacy OpenAI tas
   }
 });
 
-test("an official thread must resume onto the router before selecting a third-party model", async () => {
+test("an official thread selects a third-party route without migrating its provider", async () => {
   const alias = "relay/gpt-5.5";
   const runtime = await loadPatch({
     status: "ok",
@@ -2878,7 +2873,7 @@ test("an official thread must resume onto the router before selecting a third-pa
   };
 
   const rewritten = runtime.patch.rewriteOutgoingMessage(message);
-  assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), true);
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), false);
   assert.deepEqual(rewritten.request.params, {
     threadId: "official-thread",
     model: alias,

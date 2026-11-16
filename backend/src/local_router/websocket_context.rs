@@ -74,7 +74,10 @@ pub(crate) async fn probe_responses_websocket(
             let method = parts.next().unwrap_or_default();
             let raw_path = parts.next().unwrap_or_default();
             let path = raw_path.split('?').next().unwrap_or(raw_path);
-            if method != "GET" || !RESPONSES_WEBSOCKET_PATHS.contains(&path) {
+            if method != "GET"
+                || (!RESPONSES_WEBSOCKET_PATHS.contains(&path)
+                    && !(path.starts_with("/codey-native/") && path.ends_with("/v1/responses")))
+            {
                 return Ok(Some(false));
             }
             if let Some(header_end) = find_header_end(bytes) {
@@ -128,15 +131,16 @@ pub(crate) fn websocket_request_authorized(
     token: &str,
     bearer_token: &str,
 ) -> bool {
-    request.headers().iter().any(|(name, value)| {
-        let Ok(value) = value.to_str() else {
-            return false;
-        };
-        (name.as_str().eq_ignore_ascii_case(ROUTER_AUTH_HEADER)
-            && constant_time_eq(value.trim().as_bytes(), token.as_bytes()))
-            || (name.as_str().eq_ignore_ascii_case("authorization")
-                && constant_time_eq(value.trim().as_bytes(), bearer_token.as_bytes()))
-    })
+    native_openai_path(request.uri().path(), token) == Some("/v1/responses")
+        || request.headers().iter().any(|(name, value)| {
+            let Ok(value) = value.to_str() else {
+                return false;
+            };
+            (name.as_str().eq_ignore_ascii_case(ROUTER_AUTH_HEADER)
+                && constant_time_eq(value.trim().as_bytes(), token.as_bytes()))
+                || (name.as_str().eq_ignore_ascii_case("authorization")
+                    && constant_time_eq(value.trim().as_bytes(), bearer_token.as_bytes()))
+        })
 }
 
 pub(crate) fn websocket_forward_headers(request: &WebSocketRequest) -> Vec<(String, String)> {

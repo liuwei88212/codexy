@@ -37,6 +37,15 @@ pub(crate) struct RuntimeRouterEndpoint {
 }
 
 impl RuntimeRouterEndpoint {
+    pub(crate) fn native_openai_base_url(&self) -> String {
+        // 内置 Provider 不允许自定义鉴权头，使用仅限模型接口的能力路径保留独立路由鉴权。
+        format!(
+            "{}/codey-native/{}/v1",
+            self.base_url.trim_end_matches("/v1"),
+            self.token
+        )
+    }
+
     pub(crate) fn request_log_url(&self, theme: Option<&str>) -> String {
         let query = match theme {
             Some("light") => "?theme=light",
@@ -48,6 +57,23 @@ impl RuntimeRouterEndpoint {
             self.base_url.trim_end_matches("/v1"),
             self.token
         )
+    }
+}
+
+pub(crate) fn native_openai_path(path: &str, token: &str) -> Option<&'static str> {
+    let (provided, path) = path.strip_prefix("/codey-native/")?.split_once('/')?;
+    let path = path.strip_prefix("v1/")?;
+    if !token.is_empty() && constant_time_eq(provided.as_bytes(), token.as_bytes()) {
+        match path {
+            "responses" => Some("/v1/responses"),
+            "responses/compact" => Some("/v1/responses/compact"),
+            "models" => Some("/v1/models"),
+            "images/generations" => Some("/v1/images/generations"),
+            "images/edits" => Some("/v1/images/edits"),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 

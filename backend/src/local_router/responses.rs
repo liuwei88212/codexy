@@ -25,7 +25,7 @@ impl RouterServer {
             }
         }
         let header_budget = REQUEST_READ_TIMEOUT.saturating_sub(header_started.elapsed());
-        let pending =
+        let mut pending =
             match tokio::time::timeout(header_budget, read_http_request_head(&mut stream)).await {
                 Ok(Ok(request)) => request,
                 Ok(Err(error)) if error.is::<RequestBodyTooLarge>() => {
@@ -62,6 +62,25 @@ impl RouterServer {
                     return Ok(());
                 }
             };
+        if pending.request.path.starts_with("/codey-native/") {
+            let Some(path) = native_openai_path(&pending.request.path, &self.token) else {
+                // 能力路径含有秘密，认证失败也不能把原始路径交给请求日志。
+                write_error_response(
+                    &mut stream,
+                    401,
+                    "invalid_router_token",
+                    "Codey 本地路由认证失败",
+                    None,
+                )
+                .await?;
+                return Ok(());
+            };
+            pending.request.path = path.to_owned();
+            pending
+                .request
+                .headers
+                .push((ROUTER_AUTH_HEADER.to_owned(), self.token.clone()));
+        }
         if pending.request.path == "/healthz" {
             write_json_response(&mut stream, 200, &json!({"status":"ok"})).await?;
             return Ok(());
@@ -1070,7 +1089,9 @@ impl RouterServer {
             accept_hdr_async_with_config(
                 WebSocketIngress::new(stream, Arc::clone(&self.request_body_budget)),
                 move |request: &WebSocketRequest, mut response: WebSocketResponse| {
-                    if !RESPONSES_WEBSOCKET_PATHS.contains(&request.uri().path()) {
+                    if !RESPONSES_WEBSOCKET_PATHS.contains(&request.uri().path())
+                        && native_openai_path(request.uri().path(), &token) != Some("/v1/responses")
+                    {
                         return Err(websocket_handshake_error(
                             WebSocketStatusCode::NOT_FOUND,
                             "Codey 本地路由不支持该 WebSocket 路径",

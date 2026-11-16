@@ -1,7 +1,7 @@
 use super::*;
 use crate::codey_plugins::lifecycle::LifecycleRequest;
 
-/// 响应修复共享一次预算；响应头之前的网络故障由独立的可取消等待重试处理。
+/// 响应修复共享一次预算；网络故障只允许发送层在确定尚未发出请求时有限重连。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SendState {
     Ready,
@@ -27,7 +27,7 @@ impl RetryReason {
     }
 }
 
-/// 插件与 reasoning 修复共享一次追加发送预算，网络等待不消耗这份预算。
+/// 插件与 reasoning 修复共享一次追加发送预算。
 pub(super) struct AttemptBudget {
     state: SendState,
     retry_reason: Option<RetryReason>,
@@ -80,14 +80,6 @@ impl AttemptBudget {
 
     pub(super) fn retry_reason(&self) -> Option<RetryReason> {
         self.retry_reason
-    }
-
-    fn reserve_network_retry(&mut self) -> bool {
-        if self.state != SendState::Failed {
-            return false;
-        }
-        self.state = SendState::Ready;
-        true
     }
 }
 
@@ -252,17 +244,8 @@ impl HttpExecution<'_> {
             ..Default::default()
         };
         let header_timeout = self.response_header_timeout();
-        // 只保留尚未输出的普通流式请求。压缩及已有响应的请求继续遵循原来的失败契约。
-        let retry_network = self.upstream_stream_requested
-            && self.request_kind == ResponsesRequestKind::Create
-            && !self.compacting
-            && !downstream.event_stream_started();
         loop {
-            let network_body = retry_network.then(|| encoded.clone());
-            let retained_after_upload = if retry_network
-                || retryable_encoded.is_some()
-                || lifecycle.is_active()
-            {
+            let retained_after_upload = if retryable_encoded.is_some() || lifecycle.is_active() {
                 encoded.len()
             } else {
                 0
@@ -280,23 +263,7 @@ impl HttpExecution<'_> {
                 self.resolved.route.plugin_transport.as_ref(),
             )
             .await?;
-            let network_failed = match &result {
-                Ok(Err(error)) => error.is_connect() || error.is_timeout() || error.is_request(),
-                // 已上传请求的响应头期限不是建连故障，重放可能重复执行上游任务。
-                Err(_) => false,
-                _ => false,
-            };
-            if retry_network && network_failed && attempts.reserve_network_retry() {
-                if let Some(probe) = downstream.request_log_probe() {
-                    probe.mark_fallback("upstream_network_retry");
-                }
-                // 开始 SSE 保活后沿用下游取消监听；代理恢复前不消耗客户端的五次重连预算。
-                downstream.start_event_stream().await?;
-                await_upstream(downstream, tokio::time::sleep(Duration::from_secs(60))).await?;
-                encoded = network_body.expect("network retry retains the request body");
-                continue;
-            }
-            drop(network_body);
+            // 请求可能已经上传；响应未知时不能在外层再次发送整段历史。
             let Some(response) = self.finish_send(downstream, result, header_timeout).await? else {
                 return Ok(None);
             };
