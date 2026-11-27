@@ -765,6 +765,7 @@ if (import.meta.env.DEV) {
           },
         };
       }
+      if (command === "detect_codex_app_path") return previewConfig.codexAppPath;
       if (command === "runtime_status") {
         const activeNotificationChannelCount =
           previewConfig.webhook.channels.filter(

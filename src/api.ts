@@ -10,6 +10,7 @@ export const CODEY_API_COMMANDS = [
   "save_default_model",
   "save_official_route_models",
   "runtime_status",
+  "detect_codex_app_path",
   "open_route_request_logs",
   "query_route_request_logs",
   "query_route_request_log_stats",

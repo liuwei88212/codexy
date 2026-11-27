@@ -77,15 +77,16 @@ const byText = (tree, text) =>
   );
 const policies = (tree) => collectElements(tree, element => elementType(element) === hero.Tabs);
 
-async function deviceDialog(invoke, overrides = {}) {
+async function deviceDialog(invoke, overrides = {}, effectIndex = -1) {
   const module = await createComponentModule(
     new URL("../src/SystemSettingsDialog.tsx", import.meta.url),
     { stubs: { "./components/ui": ui, "@heroui/react": hero, "@tabler/icons-react": icons, "./api": { invoke } } },
   );
-  let effect;
-  module.react.useEffect = callback => { effect = callback; };
+  let effects = [];
+  module.react.useEffect = callback => { effects.push(callback); };
   const props = { ...renderDialog().props, ...overrides };
   const render = () => {
+    effects = [];
     module.restart();
     return module.exports.SystemSettingsDialog(props);
   };
@@ -97,7 +98,7 @@ async function deviceDialog(invoke, overrides = {}) {
     render,
     runEffect: () => {
       cleanup?.();
-      cleanup = effect();
+      cleanup = effects.at(effectIndex)();
       return cleanup;
     },
   };
@@ -247,25 +248,26 @@ test("设备号复制失败不显示成功反馈", async (t) => {
   assert.equal(collectElements(tree, e => elementProps(e).content === "复制失败，请选中设备号手动复制").length, 1);
 });
 
-test("复制路径、修复配置与更新策略都接到真实回调", async (t) => {
+test("未检测时不复制虚假路径，修复配置与更新策略接到真实回调", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   clipboardWrites.length = 0;
   const { calls, tree } = renderDialog();
   const text = textContent(tree);
   assert.match(text, /v1\.1\.1/);
   assert.match(text, /v0\.4\.0/);
-  assert.match(text, /\/Applications\/ChatGPT\.app/);
+  assert.doesNotMatch(text, /\/Applications\/ChatGPT\.app/);
 
   const [copyButton] = byLabel(tree, "复制 Codex 路径");
   assert.ok(copyButton, "复制按钮必须带 aria-label");
+  assert.equal(elementProps(copyButton).disabled, true);
   await elementProps(copyButton).onClick();
-  assert.deepEqual(clipboardWrites, ["/Applications/ChatGPT.app"]);
+  assert.deepEqual(clipboardWrites, []);
 
-  // 未配置 Codex 路径时复制默认路径，按钮依旧可用。
+  // 未配置时也不能复制其他平台的默认目录。
   clipboardWrites.length = 0;
   const fallback = renderDialog({ codexAppPath: "" });
   await elementProps(byLabel(fallback.tree, "复制 Codex 路径")[0]).onClick();
-  assert.deepEqual(clipboardWrites, ["/Applications/ChatGPT.app"]);
+  assert.deepEqual(clipboardWrites, []);
 
   const [repairButton] = byText(tree, "修复");
   assert.ok(repairButton, "修复按钮必须存在");
@@ -290,6 +292,52 @@ test("复制路径、修复配置与更新策略都接到真实回调", async (t
     collectElements(tree, (e) => /仍可手动检查稳定版/.test(elementProps(e).content ?? "")).length > 0 ||
     /仍可手动检查稳定版/.test(textContent(tree)),
   );
+});
+
+test("设置打开时自动检测并复制实际 Windows 安装目录，而非旧配置", async () => {
+  const path = String.raw`C:\Program Files\WindowsApps\OpenAI.Codex_26.1117.4957.0_x64__2p2nqsd0c76g0\app`;
+  const calls = [];
+  const fixture = await deviceDialog(async command => { calls.push(command); return path; }, {}, -2);
+  fixture.runEffect();
+  assert.match(textContent(fixture.render()), /正在自动查找/);
+  await new Promise(setImmediate);
+  const tree = fixture.render();
+  assert.deepEqual(calls, ["detect_codex_app_path"]);
+  assert.ok(textContent(tree).includes(path));
+  assert.doesNotMatch(textContent(tree), /\/Applications\/ChatGPT\.app/);
+  const copy = elementProps(byLabel(tree, "复制 Codex 路径")[0]);
+  assert.equal(copy.disabled, false);
+  clipboardWrites.length = 0;
+  await copy.onClick();
+  assert.deepEqual(clipboardWrites, [path]);
+});
+
+test("目录检测失败与超时不展示旧路径，关闭后忽略迟到结果", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const failed = await deviceDialog(async () => { throw new Error("未找到 Codex"); }, {}, -2);
+  failed.runEffect();
+  await new Promise(setImmediate);
+  assert.match(textContent(failed.render()), /未找到 Codex/);
+  assert.equal(elementProps(byLabel(failed.render(), "复制 Codex 路径")[0]).disabled, true);
+  let resolve;
+  const slow = await deviceDialog(() => new Promise(done => { resolve = done; }), {}, -2);
+  slow.runEffect();
+  t.mock.timers.tick(20000);
+  resolve("late-path");
+  await new Promise(setImmediate);
+  assert.match(textContent(slow.render()), /检测超时/);
+  assert.doesNotMatch(textContent(slow.render()), /late-path/);
+  const closed = await deviceDialog(() => { throw new Error("不应请求"); }, { open: false }, -2);
+  closed.runEffect();
+  let finish;
+  const closing = await deviceDialog(() => new Promise(done => { finish = done; }), {}, -2);
+  closing.runEffect();
+  closing.props.open = false;
+  closing.render();
+  closing.runEffect();
+  finish("closed-path");
+  await new Promise(setImmediate);
+  assert.doesNotMatch(textContent(closing.render()), /closed-path/);
 });
 
 test("更新策略跟随配置、修复中显示进行态", () => {

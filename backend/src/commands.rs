@@ -1196,6 +1196,19 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "save_selected_models"
         | "save_default_model"
         | "save_official_route_models" => models::invoke(state, command, &args).await,
+        "detect_codex_app_path" => {
+            let runtime = state.runtime.lock().await.clone();
+            if let Some(runtime) = runtime {
+                Ok(json!(runtime.codex_app_path.to_string_lossy()))
+            } else {
+                // 与启动共用定位入口，自动刷新 Store 路径；只读检测不弹出目录选择器。
+                let config = state.config.read().await.clone();
+                crate::launcher::resolve_configured_codex_app_dir(&config)
+                    .await
+                    .map(|path| json!(path.to_string_lossy()))
+                    .map_err(|error| format!("{error:#}"))
+            }
+        }
         "runtime_status" => {
             let refresh_injection_status = args
                 .get("refreshInjectionStatus")

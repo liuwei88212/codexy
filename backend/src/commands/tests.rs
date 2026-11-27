@@ -30,6 +30,10 @@ async fn installed_store_codex_recovers_and_saves_a_removed_version_path() {
         }),
         ..AppState::default()
     });
+    let detected = invoke_api(&state, "detect_codex_app_path", json!({})).await;
+    assert_eq!(std::fs::canonicalize(detected.as_str().unwrap()).unwrap(), current);
+    assert_eq!(state.config.read().await.settings_revision, 0);
+    assert!(!state.store.path().exists());
     ensure_windows_codex_app_path(&state).await.unwrap();
     let saved = state.store.load().unwrap();
     assert_eq!(std::fs::canonicalize(&saved.codex_app_path).unwrap(), current);
@@ -37,6 +41,24 @@ async fn installed_store_codex_recovers_and_saves_a_removed_version_path() {
     ensure_windows_codex_app_path(&state).await.unwrap();
     assert_eq!(state.store.load().unwrap().settings_revision, 1);
     println!("Resolved and saved Codex path {}", saved.codex_app_path);
+}
+
+#[tokio::test]
+async fn codex_path_detection_reports_invalid_selection_without_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(CodeyConfig {
+            codex_app_path: directory.path().join("missing-app").to_string_lossy().into_owned(),
+            ..CodeyConfig::default()
+        }),
+        ..AppState::default()
+    });
+    let result = invoke_api(&state, "detect_codex_app_path", json!({})).await;
+    assert_eq!(result["status"], "failed");
+    assert!(result["message"].as_str().is_some_and(|message| !message.is_empty()));
+    assert!(!state.store.path().exists());
+    assert_eq!(state.config.read().await.settings_revision, 0);
 }
 
 #[tokio::test]

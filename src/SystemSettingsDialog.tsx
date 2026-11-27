@@ -63,11 +63,47 @@ function SystemSettingsDialogComponent({
   >("idle");
   const machineNoCopyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pathCopyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [detectedCodexPath, setDetectedCodexPath] = useState("");
+  const [pathLoading, setPathLoading] = useState(false);
+  const [pathError, setPathError] = useState("");
 
   useEffect(() => () => {
     if (machineNoCopyTimer.current !== null) clearTimeout(machineNoCopyTimer.current);
     if (pathCopyTimer.current !== null) clearTimeout(pathCopyTimer.current);
   }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setDetectedCodexPath("");
+    setCopied(false);
+    setPathLoading(true);
+    setPathError("");
+    const timer = setTimeout(() => {
+      cancelled = true;
+      setPathLoading(false);
+      setPathError("检测超时，请稍后重新打开设置重试。");
+    }, 20000);
+    // 显示经校验的当前安装目录，不把旧配置或其他平台的默认值当成检测结果。
+    void invoke<string>("detect_codex_app_path").then(
+      (path) => {
+        if (cancelled) return;
+        clearTimeout(timer);
+        setDetectedCodexPath(path);
+        setPathLoading(false);
+      },
+      (error: unknown) => {
+        if (cancelled) return;
+        clearTimeout(timer);
+        setPathError(errorText(error));
+        setPathLoading(false);
+      },
+    );
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [open, codexAppPath]);
 
   useEffect(() => {
     if (!open) return;
@@ -122,12 +158,13 @@ function SystemSettingsDialogComponent({
     }, 2000);
   };
 
-  const resolvedCodexPath = codexAppPath || "/Applications/ChatGPT.app";
+  const resolvedCodexPath = detectedCodexPath;
   const formattedCodexVersion = codexAppVersion?.trim()
     ? `v${codexAppVersion.trim().replace(/^v/, "")}`
     : "未运行 / 未检测到";
 
   const handleCopyPath = async () => {
+    if (!resolvedCodexPath || pathLoading || pathError) return;
     try {
       await navigator.clipboard.writeText(resolvedCodexPath);
       setCopied(true);
@@ -235,7 +272,7 @@ function SystemSettingsDialogComponent({
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--codey-muted)]">
                   <IconFolder size={14} className="shrink-0 text-[var(--codey-muted)]" aria-hidden="true" />
-                  <span>Codex 目录</span>
+                  <span>Codex 目录 · 自动检测</span>
                 </div>
                 <Tooltip content={copied ? "已复制到剪贴板" : "复制路径"}>
                   <Button
@@ -243,6 +280,7 @@ function SystemSettingsDialogComponent({
                     size="icon-sm"
                     className="size-6 min-w-6 shrink-0 text-[var(--codey-muted)] hover:text-[var(--codey-text)]"
                     aria-label="复制 Codex 路径"
+                    disabled={!resolvedCodexPath || pathLoading || Boolean(pathError)}
                     onClick={handleCopyPath}
                   >
                     {copied ? (
@@ -253,14 +291,15 @@ function SystemSettingsDialogComponent({
                   </Button>
                 </Tooltip>
               </div>
-              <div className="rounded-lg border border-[var(--codey-border-subtle)] bg-[var(--codey-surface,#fff)] px-2.5 py-1.5">
+              <div aria-live="polite" className="rounded-lg border border-[var(--codey-border-subtle)] bg-[var(--codey-surface,#fff)] px-2.5 py-1.5">
                 <code
                   className="block font-mono text-[11px] text-[var(--codey-text)] break-all select-all leading-relaxed max-h-20 overflow-y-auto"
                   title={resolvedCodexPath}
                 >
-                  {resolvedCodexPath}
+                  {pathLoading ? "正在自动查找 Codex 安装目录…" : pathError ? "未检测到 Codex 目录" : resolvedCodexPath || "尚未检测"}
                 </code>
               </div>
+              {pathError && <p role="status" className="break-words text-xs text-danger">{pathError}</p>}
             </div>
           </div>
 
